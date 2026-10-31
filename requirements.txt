@@ -1,0 +1,12 @@
+requests
+pandas
+numpy
+beautifulsoup4
+lxml
+scikit-learn
+mlflow
+streamlit
+python-dotenv
+openai
+faiss-cpu
+sentence-transformers

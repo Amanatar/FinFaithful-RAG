@@ -1,0 +1,36 @@
+# Environments & Secrets
+.env
+*.env
+.env.*
+!.env.example
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Python cache & artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Data, Caches & Indexes (SEC EDGAR, Vector Indexes)
+data/
+outputs/
+mlruns/
+*.faiss
+*.index
+*.pkl
+*.pickle
+sec_edgar_filings/
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
