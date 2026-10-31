@@ -11,9 +11,10 @@ load_dotenv()
 
 
 def get_client():
+    api_key = os.getenv("NVIDIA_API_KEY") or "nvapi-placeholder-mock"
     return OpenAI(
         base_url="https://integrate.api.nvidia.com/v1",
-        api_key=os.getenv("NVIDIA_API_KEY"),
+        api_key=api_key,
     )
 
 

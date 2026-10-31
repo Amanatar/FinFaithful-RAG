@@ -1,4 +1,6 @@
 import os
+os.environ.setdefault("NVIDIA_API_KEY", "nvapi-placeholder-mock")
+import os
 import sys
 import time
 import pytest

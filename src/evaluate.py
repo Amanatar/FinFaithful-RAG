@@ -8,9 +8,10 @@ from openai import OpenAI
 from rag_qa import ask
 
 load_dotenv()
+api_key = os.getenv("NVIDIA_API_KEY") or "nvapi-placeholder-mock"
 client = OpenAI(
     base_url="https://integrate.api.nvidia.com/v1",
-    api_key=os.getenv("NVIDIA_API_KEY"),
+    api_key=api_key,
 )
 
 benchmark = [
