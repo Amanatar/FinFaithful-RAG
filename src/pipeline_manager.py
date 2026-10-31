@@ -1,3 +1,4 @@
+import os
 import pickle
 import time
 from pathlib import Path
@@ -13,7 +14,7 @@ try:
 except ImportError:  # pragma: no cover - fallback for package-style imports
     from .ticker_lookup import get_cik, get_company_name
 
-HEADERS = {"User-Agent": "Aman Atar ataraman9@gmail.com"}
+HEADERS = {"User-Agent": os.getenv("SEC_USER_AGENT", "AmanAtarResearch ataraman9@gmail.com")}
 DATA_DIR = Path("data/raw/sec")
 TEXT_DIR = Path("data/processed/sec_text")
 OUT_DIR = Path("outputs")

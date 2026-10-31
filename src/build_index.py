@@ -54,4 +54,7 @@ def build() -> None:
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Build FAISS vector index from processed SEC text chunks.")
+    parser.parse_args()
     build()

@@ -1,3 +1,5 @@
+import argparse
+import os
 import time
 from pathlib import Path
 
@@ -5,7 +7,7 @@ import requests
 
 DATA_DIR = Path("data/raw/sec")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-HEADERS = {"User-Agent": "Aman Atar ataraman9@gmail.com"}
+HEADERS = {"User-Agent": os.getenv("SEC_USER_AGENT", "AmanAtarResearch ataraman9@gmail.com")}
 
 
 def download(ticker: str = "AAPL", cik: str = "320193", lim: int = 3) -> None:
@@ -40,4 +42,9 @@ def download(ticker: str = "AAPL", cik: str = "320193", lim: int = 3) -> None:
 
 
 if __name__ == "__main__":
-    download()
+    parser = argparse.ArgumentParser(description="Download SEC EDGAR 10-K filings.")
+    parser.add_argument("--ticker", default="AAPL", help="Stock ticker symbol (default: AAPL)")
+    parser.add_argument("--cik", default="320193", help="SEC CIK number (default: 320193 for Apple)")
+    parser.add_argument("--limit", type=int, default=3, help="Max filings to fetch (default: 3)")
+    args = parser.parse_args()
+    download(args.ticker, args.cik, args.limit)
