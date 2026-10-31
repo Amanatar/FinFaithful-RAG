@@ -53,35 +53,40 @@ Respond ONLY with a JSON object like this:
         return '{"faithfulness_score": 0, "relevance_score": 0, "reason": "Judge failed"}'
 
 
-print("🚀 Starting Advanced RAG Evaluation (with LLM-as-a-Judge)...")
-print("-" * 50)
+def run_evaluation():
+    print("Starting Advanced RAG Evaluation (with LLM-as-a-Judge)...")
+    print("-" * 50)
 
-results = []
-for item in benchmark:
-    print(f"\n🔎 Q{item['id']}: {item['question']}")
-    start_time = time.time()
+    results = []
+    for item in benchmark:
+        print(f"\nQ{item['id']}: {item['question']}")
+        start_time = time.time()
 
-    answer, context = ask(item["question"])
-    latency = round(time.time() - start_time, 2)
+        answer, context = ask(item["question"])
+        latency = round(time.time() - start_time, 2)
 
-    print("⚖️ Judging answer with Llama-3...")
-    judge_result = judge_answer(item["question"], answer, context)
+        print("Judging answer with Llama-3...")
+        judge_result = judge_answer(item["question"], answer, context)
 
-    results.append(
-        {
-            "id": item["id"],
-            "question": item["question"],
-            "ai_answer": answer,
-            "latency_seconds": latency,
-            "judge_scores": judge_result,
-        }
-    )
-    print(f"✅ Completed in {latency}s")
+        results.append(
+            {
+                "id": item["id"],
+                "question": item["question"],
+                "ai_answer": answer,
+                "latency_seconds": latency,
+                "judge_scores": judge_result,
+            }
+        )
+        print(f"Completed in {latency}s")
 
-with open("outputs/advanced_rag_evaluation.csv", "w", newline="", encoding="utf-8") as f:
-    writer = csv.DictWriter(f, fieldnames=results[0].keys())
-    writer.writeheader()
-    writer.writerows(results)
+    os.makedirs("outputs", exist_ok=True)
+    with open("outputs/advanced_rag_evaluation.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=results[0].keys())
+        writer.writeheader()
+        writer.writerows(results)
 
-print("\n" + "=" * 50)
-print("🎉 Advanced Evaluation Complete! Saved to outputs/advanced_rag_evaluation.csv")
+    print("\n" + "=" * 50)
+
+
+if __name__ == "__main__":
+    run_evaluation()
