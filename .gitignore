@@ -20,7 +20,9 @@ __pycache__/
 htmlcov/
 
 # Data, Caches & Indexes (SEC EDGAR, Vector Indexes)
-data/
+data/*
+!data/eval/
+!data/eval/**
 outputs/
 mlruns/
 *.faiss
@@ -28,6 +30,12 @@ mlruns/
 *.pkl
 *.pickle
 sec_edgar_filings/
+
+# Allow artifacts bundle
+!artifacts/
+!artifacts/sec_index/
+!artifacts/sec_index/**
+
 
 # OS & Editor
 .DS_Store
