@@ -2,77 +2,77 @@ import os
 import pickle
 import time
 from pathlib import Path
+from typing import Optional
 
 import faiss
 import numpy as np
 import requests
-from bs4 import BeautifulSoup
 from sentence_transformers import SentenceTransformer
 
 try:
     from ticker_lookup import get_cik, get_company_name
-except ImportError:  # pragma: no cover - fallback for package-style imports
+except ImportError:  # pragma: no cover
     from .ticker_lookup import get_cik, get_company_name
 
+try:
+    from sec_parser import chunk_section, parse_and_save_filing
+except ImportError:
+    from .sec_parser import chunk_section, parse_and_save_filing
+
+try:
+    from download_sec import download_filing_for_ticker
+except ImportError:
+    from .download_sec import download_filing_for_ticker
+
 HEADERS = {"User-Agent": os.getenv("SEC_USER_AGENT", "AmanAtarResearch ataraman9@gmail.com")}
-DATA_DIR = Path("data/raw/sec")
+DATA_DIR = Path("data/raw_10k")
+LEGACY_RAW_DIR = Path("data/raw/sec")
 TEXT_DIR = Path("data/processed/sec_text")
+PROCESSED_10K_DIR = Path("data/processed_10k")
 OUT_DIR = Path("outputs")
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+LEGACY_RAW_DIR.mkdir(parents=True, exist_ok=True)
 TEXT_DIR.mkdir(parents=True, exist_ok=True)
+PROCESSED_10K_DIR.mkdir(parents=True, exist_ok=True)
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def download_filings(ticker: str, limit: int = 3, progress_callback=None):
-    """Downloads 10-K filings for a given ticker."""
-    cik = get_cik(ticker)
-    company_name = get_company_name(ticker)
-
+def download_filings(ticker: str, limit: int = 1, progress_callback=None) -> int:
+    """Downloads 10-K filings for a given ticker with table preservation."""
+    ticker = ticker.upper().strip()
     if progress_callback:
-        progress_callback(f"📡 Downloading {company_name} ({ticker}) filings from SEC EDGAR...")
-
-    url = f"https://data.sec.gov/submissions/CIK{cik.zfill(10)}.json"
-    res = requests.get(url, headers=HEADERS, timeout=30)
-    res.raise_for_status()
-    recent = res.json()["filings"]["recent"]
-
-    downloaded = 0
-    for i, form in enumerate(recent["form"]):
-        if form == "10-K" and downloaded < limit:
-            acc = recent["accessionNumber"][i].replace("-", "")
-            doc = recent["primaryDocument"][i]
-            filing_date = recent["filingDate"][i]
-            f_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc}/{doc}"
-
-            if progress_callback:
-                progress_callback(f"  ↳ Downloading 10-K from {filing_date}...")
-
-            html = requests.get(f_url, headers=HEADERS, timeout=60).text
-            out_file = DATA_DIR / f"{ticker}_{filing_date}.html"
-            with open(out_file, "w", encoding="utf-8") as f:
-                f.write(html)
-
-            downloaded += 1
-            time.sleep(0.5)
-
-    return downloaded
+        progress_callback(f"📡 Downloading {ticker} 10-K filings from SEC EDGAR...")
+    files = download_filing_for_ticker(
+        ticker=ticker,
+        limit=limit,
+        raw_dir=DATA_DIR,
+        processed_dir=PROCESSED_10K_DIR,
+        auto_parse=True,
+    )
+    return len(files)
 
 
-def parse_filings(ticker: str, progress_callback=None):
-    """Parses downloaded HTML filings into text."""
+def parse_filings(ticker: str, progress_callback=None) -> int:
+    """Parses downloaded HTML filings into structured sections with Markdown tables."""
+    ticker = ticker.upper().strip()
     if progress_callback:
-        progress_callback("📄 Parsing HTML filings into clean text...")
+        progress_callback(f"📄 Parsing {ticker} HTML filings into structured sections...")
 
     parsed = 0
-    for f in DATA_DIR.glob(f"{ticker}_*.html"):
-        with open(f, "r", encoding="utf-8") as file:
-            soup = BeautifulSoup(file.read(), "lxml")
-        text = soup.get_text(separator="\n", strip=True)
+    raw_files = list(DATA_DIR.glob(f"{ticker}_*.html"))
+    if not raw_files:
+        raw_files = list(LEGACY_RAW_DIR.glob(f"{ticker}_*.html"))
 
-        out_path = TEXT_DIR / f.with_suffix(".txt").name
-        with open(out_path, "w", encoding="utf-8") as out:
-            out.write(text)
+    for f in raw_files:
+        fdate = f.stem.split("_")[-1] if "_" in f.stem else "2026-11-03"
+        parse_and_save_filing(
+            raw_html_path=f,
+            ticker=ticker,
+            filing_date=fdate,
+            output_dir=PROCESSED_10K_DIR,
+            cik=get_cik(ticker),
+        )
         parsed += 1
 
     return parsed
@@ -83,19 +83,41 @@ def chunk(text: str, size: int = 1200, overlap: int = 150) -> list[str]:
     return [text[i : i + size] for i in range(0, len(text), step)]
 
 
-def build_index(ticker: str, progress_callback=None):
+def build_index(ticker: str, progress_callback=None) -> int:
     """Builds FAISS vector index for the ticker's filings."""
+    ticker = ticker.upper().strip()
     if progress_callback:
         progress_callback("🧠 Loading embedding model...")
 
     model = SentenceTransformer("all-MiniLM-L6-v2")
 
+    import json
     chunks, meta = [], []
-    for f in TEXT_DIR.glob(f"{ticker}_*.txt"):
-        text = f.read_text(encoding="utf-8")
-        for i, c in enumerate(chunk(text)):
-            chunks.append(c)
-            meta.append({"source": f.name, "chunk_id": i})
+    for f in PROCESSED_10K_DIR.glob(f"{ticker}_*_parsed.json"):
+        with open(f, "r", encoding="utf-8") as jf:
+            parsed_data = json.load(jf)
+        for sec_id, sec_data in parsed_data.get("sections", {}).items():
+            sec_chunks = chunk_section(
+                section_data=sec_data,
+                ticker=ticker,
+                fiscal_year=parsed_data.get("fiscal_year", 2026),
+            )
+            for sc in sec_chunks:
+                chunks.append(sc["text"])
+                meta.append({
+                    "source": f"{ticker}_{parsed_data.get('filing_date', '')}.html",
+                    "chunk_id": sc["chunk_id"],
+                    "section_id": sc["item_section"],
+                    "is_table": sc["is_table"],
+                })
+
+    if not chunks:
+        # Fallback to legacy text
+        for f in TEXT_DIR.glob(f"{ticker}_*.txt"):
+            text = f.read_text(encoding="utf-8")
+            for i, c in enumerate(chunk(text)):
+                chunks.append(c)
+                meta.append({"source": f.name, "chunk_id": i})
 
     if not chunks:
         raise ValueError(f"No text chunks found for {ticker}. Run download and parse first.")
@@ -103,11 +125,11 @@ def build_index(ticker: str, progress_callback=None):
     if progress_callback:
         progress_callback(f"🔢 Generating vectors for {len(chunks)} chunks...")
 
-    embeddings = model.encode(chunks, show_progress_bar=False)
-    embeddings = np.asarray(embeddings, dtype="float32")
+    embeddings = model.encode(chunks, show_progress_bar=False, normalize_embeddings=True)
+    embeddings = np.ascontiguousarray(embeddings, dtype="float32")
 
     dimension = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dimension)
+    index = faiss.IndexFlatIP(dimension)
     index.add(embeddings)
 
     index_path = OUT_DIR / f"{ticker}_faiss.index"
@@ -126,7 +148,7 @@ def build_index(ticker: str, progress_callback=None):
 def run_full_pipeline(ticker: str, progress_callback=None):
     """Runs the complete pipeline: download → parse → index."""
     try:
-        downloaded = download_filings(ticker, limit=3, progress_callback=progress_callback)
+        downloaded = download_filings(ticker, limit=1, progress_callback=progress_callback)
         parsed = parse_filings(ticker, progress_callback=progress_callback)
         chunks = build_index(ticker, progress_callback=progress_callback)
 
@@ -139,3 +161,44 @@ def run_full_pipeline(ticker: str, progress_callback=None):
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+def query_pipeline(
+    query: str,
+    mode: str = "hybrid_rerank",
+    top_k: int = 5,
+    ticker_filter: Optional[list] = None,
+) -> dict:
+    """
+    Executes the 4-tier retrieval and citation generation pipeline.
+    Modes:
+    - 'direct_llm': Ungrounded Baseline (0 chunks)
+    - 'sparse_bm25': BM25 lexical retrieval (top-5)
+    - 'dense_faiss': FAISS dense semantic retrieval (top-5)
+    - 'hybrid_rerank': Flagship RRF + Cross-Encoder reranking (top-5)
+    """
+    try:
+        from retriever import retrieve
+        from generator import generate
+    except ImportError:
+        from .retriever import retrieve
+        from .generator import generate
+
+    ret_res = retrieve(query=query, mode=mode, top_k=top_k, tickers=ticker_filter)
+    gen_res = generate(query=query, retrieved_chunks=ret_res["chunks"], mode=mode)
+
+    return {
+        "query": query,
+        "mode": mode,
+        "detected_tickers": ret_res["detected_tickers"],
+        "retrieved_chunks": ret_res["chunks"],
+        "retrieval_latency_ms": ret_res["retrieval_ms"],
+        "rerank_latency_ms": ret_res["rerank_ms"],
+        "total_retrieval_ms": ret_res["total_latency_ms"],
+        "generation_latency_ms": gen_res["generation_latency_ms"],
+        "total_latency_ms": ret_res["total_latency_ms"] + gen_res["generation_latency_ms"],
+        "answer": gen_res["answer"],
+        "citation_audit": gen_res["citation_audit"],
+        "engine": gen_res["engine"],
+    }
+
