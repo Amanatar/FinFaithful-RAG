@@ -113,6 +113,18 @@ def load_benchmark_runs() -> List[Dict[str, Any]]:
     return []
 
 
+def _safe_get_secret(key: str) -> str:
+    val = os.getenv(key, "")
+    if val:
+        return val
+    try:
+        if hasattr(st, "secrets") and key in st.secrets:
+            return str(st.secrets[key])
+    except Exception:
+        pass
+    return ""
+
+
 # =============================================================================
 # SIDEBAR CONTROLS
 # =============================================================================
@@ -135,9 +147,9 @@ with st.sidebar:
     st.divider()
 
     # Detect Credentials
-    groq_k = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", "")
-    hf_k = os.getenv("HF_TOKEN") or st.secrets.get("HF_TOKEN", "")
-    nv_k = os.getenv("NVIDIA_API_KEY") or st.secrets.get("NVIDIA_API_KEY", "")
+    groq_k = _safe_get_secret("GROQ_API_KEY")
+    hf_k = _safe_get_secret("HF_TOKEN")
+    nv_k = _safe_get_secret("NVIDIA_API_KEY")
 
     active_provider = "None (Inspection Only)"
     if groq_k:
