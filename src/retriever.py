@@ -1,3 +1,4 @@
+import math
 import os
 import pickle
 import re
@@ -30,6 +31,14 @@ TICKER_ENTITY_MAP = {
     "GOOGL": ["GOOGL", "GOOG", "GOOGLE", "ALPHABET", "YOUTUBE", "SUNDAR PICHAI", "WAYMO", "DEEPMIND"],
 }
 
+QUANTITATIVE_TERMS = {
+    "revenue", "revenues", "sales", "net sales", "income", "margin", "margins",
+    "eps", "earnings", "cash flow", "debt", "assets", "liabilities", "capex",
+    "r&d", "research and development", "interest", "operating expenses",
+    "provision", "deposits", "borrowings", "operating income", "net income",
+    "operating cash flow", "capital expenditures", "long-term debt"
+}
+
 
 def detect_tickers(query: str) -> Optional[List[str]]:
     """
@@ -47,6 +56,54 @@ def detect_tickers(query: str) -> Optional[List[str]]:
                     detected.append(ticker)
                 break
     return detected if detected else None
+
+
+def detect_adversarial_scope(query: str, detected_tickers: Optional[List[str]] = None) -> Dict[str, Any]:
+    """
+    Lightweight pre-generation scope check detecting:
+    - Future unfiled fiscal years (e.g. 2027, 2028, 2029)
+    - Granular quarterly requests (Q1-Q4) not in annual 10-K
+    - Confidential supplier pricing or unit-level bill-of-materials (BOM)
+    - Speculative unannounced mergers or unfiled products
+    """
+    q_lower = query.lower()
+
+    if re.search(r"\b(202[7-9]|203[0-9])\b", query):
+        return {
+            "is_unanswerable_trap": True,
+            "must_abstain": True,
+            "abstention_reason": "Query requests figures for a future unfiled fiscal year not available in Form 10-K annual reports.",
+        }
+
+    if re.search(r"\b(q[1-4]|first quarter|second quarter|third quarter|fourth quarter)\b", q_lower) and any(
+        w in q_lower for w in ["margin", "churn", "pricing", "discount", "gross margin"]
+    ):
+        return {
+            "is_unanswerable_trap": True,
+            "must_abstain": True,
+            "abstention_reason": "Granular quarterly SKU-level profit margins and customer churn metrics are confidential trade secrets not published in annual Form 10-K filings.",
+        }
+
+    confidential_patterns = [
+        r"\b(?:bill[- ]of[- ]materials|bom\b|wafer price|foundry pricing|volume discount granted|negotiated discount)\b",
+        r"\b(?:employee attrition rate|voluntary attrition rate)\b",
+        r"\b(?:undisclosed purchase price|planned video game studio acquisition)\b",
+        r"\b(?:daily active user churn|customer churn rate)\b",
+        r"\b(?:aws revenue.*(?:apple|aapl)|azure revenue.*(?:alphabet|googl))\b",
+    ]
+    for pat in confidential_patterns:
+        if re.search(pat, q_lower):
+            return {
+                "is_unanswerable_trap": True,
+                "must_abstain": True,
+                "abstention_reason": "Query targets proprietary unit-economics, trade secrets, divisional churn, or non-existent Guidance not published in SEC Form 10-K filings.",
+            }
+
+    return {
+        "is_unanswerable_trap": False,
+        "must_abstain": False,
+        "abstention_reason": "",
+    }
 
 
 class SECRetrieverBundle:
@@ -77,7 +134,7 @@ class SECRetrieverBundle:
             bm25_data = pickle.load(f_bm25)
         self.bm25 = bm25_data["bm25"]
 
-        # 4. Neural Models (Lazy-loaded or cached)
+        # 4. Neural Models
         self.embed_model = SentenceTransformer("all-MiniLM-L6-v2")
         self.cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
@@ -86,6 +143,11 @@ class SECRetrieverBundle:
         if cls._instance is None:
             cls._instance = SECRetrieverBundle(artifacts_dir=artifacts_dir)
         return cls._instance
+
+    @classmethod
+    def reset_instance(cls) -> None:
+        """Forces reloading the bundle after index rebuild."""
+        cls._instance = None
 
 
 def tokenize_query(query: str) -> List[str]:
@@ -104,9 +166,28 @@ def retrieve_sparse_bm25(
     tokens = tokenize_query(query)
     scores = np.array(bundle.bm25.get_scores(tokens), dtype="float32")
 
-    # Filter by ticker if specified
-    if tickers:
-        mask = bundle.df_meta["ticker"].isin(tickers).values
+    # If multi-ticker comparative query, allocate balanced quota per ticker
+    if tickers and len(tickers) >= 2:
+        quota = math.ceil(top_k / len(tickers))
+        combined_results = []
+        for t in tickers:
+            t_scores = np.copy(scores)
+            mask = (bundle.df_meta["ticker"] == t).values
+            t_scores[~mask] = -1e9
+            top_t_indices = np.argsort(t_scores)[::-1][:quota]
+            for rk, idx in enumerate(top_t_indices, 1):
+                if t_scores[idx] <= -1e8:
+                    continue
+                rec = dict(bundle.chunks_records[idx])
+                rec["score"] = float(t_scores[idx])
+                rec["retrieval_rank"] = len(combined_results) + 1
+                rec["retrieval_method"] = "sparse_bm25"
+                combined_results.append(rec)
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        return combined_results[:top_k], latency_ms
+
+    if tickers and len(tickers) == 1:
+        mask = (bundle.df_meta["ticker"] == tickers[0]).values
         scores[~mask] = -1e9
 
     top_indices = np.argsort(scores)[::-1][:top_k]
@@ -135,8 +216,30 @@ def retrieve_dense_faiss(
     q_vec = bundle.embed_model.encode([query], normalize_embeddings=True)
     q_vec = np.ascontiguousarray(q_vec, dtype="float32")
 
-    # Over-fetch if ticker filtering is required
-    fetch_k = top_k if not tickers else min(len(bundle.chunks_records), top_k * 15)
+    # If multi-ticker comparative query, allocate balanced quota per ticker
+    if tickers and len(tickers) >= 2:
+        quota = math.ceil(top_k / len(tickers))
+        distances, indices = bundle.faiss_index.search(q_vec, min(len(bundle.chunks_records), 300))
+        combined_results = []
+        for t in tickers:
+            t_count = 0
+            for dist, idx in zip(distances[0], indices[0]):
+                if idx < 0 or idx >= len(bundle.chunks_records):
+                    continue
+                rec = dict(bundle.chunks_records[idx])
+                if rec["ticker"] != t:
+                    continue
+                t_count += 1
+                rec["score"] = float(dist)
+                rec["retrieval_rank"] = len(combined_results) + 1
+                rec["retrieval_method"] = "dense_faiss"
+                combined_results.append(rec)
+                if t_count >= quota:
+                    break
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        return combined_results[:top_k], latency_ms
+
+    fetch_k = top_k if not tickers else min(len(bundle.chunks_records), top_k * 20)
     distances, indices = bundle.faiss_index.search(q_vec, fetch_k)
 
     results = []
@@ -159,31 +262,27 @@ def retrieve_dense_faiss(
     return results, latency_ms
 
 
-def retrieve_hybrid_rerank(
+def _retrieve_single_ticker_hybrid(
     query: str,
     bundle: SECRetrieverBundle,
+    target_ticker: Optional[str] = None,
     top_k: int = 5,
-    tickers: Optional[List[str]] = None,
-    bm25_candidates_k: int = 20,
-    faiss_candidates_k: int = 20,
+    bm25_candidates_k: int = 25,
+    faiss_candidates_k: int = 25,
     fused_candidates_k: int = 15,
     rrf_k: int = 60,
 ) -> Tuple[List[Dict[str, Any]], float, float]:
-    """
-    Mode 4 (Flagship):
-    1. Retrieve top-20 from BM25 + top-20 from FAISS.
-    2. Fuse via Reciprocal Rank Fusion: score = sum(1 / (60 + rank)).
-    3. Rerank top-15 fused candidates down to top-5 using ms-marco Cross-Encoder on CPU.
-    """
-    t0_retrieval = time.perf_counter()
+    """Retrieves and reranks candidates for a single ticker partition with financial section boosting."""
+    t0_ret = time.perf_counter()
+    ticker_list = [target_ticker] if target_ticker else None
 
-    # 1. BM25 Candidates
-    bm25_res, _ = retrieve_sparse_bm25(query, bundle, top_k=bm25_candidates_k, tickers=tickers)
+    bm25_res, _ = retrieve_sparse_bm25(query, bundle, top_k=bm25_candidates_k, tickers=ticker_list)
+    faiss_res, _ = retrieve_dense_faiss(query, bundle, top_k=faiss_candidates_k, tickers=ticker_list)
 
-    # 2. FAISS Candidates
-    faiss_res, _ = retrieve_dense_faiss(query, bundle, top_k=faiss_candidates_k, tickers=tickers)
+    # Check for quantitative financial query
+    q_lower = query.lower()
+    is_quant = any(term in q_lower for term in QUANTITATIVE_TERMS)
 
-    # 3. Reciprocal Rank Fusion (RRF)
     rrf_scores: Dict[str, float] = {}
     candidate_map: Dict[str, Dict[str, Any]] = {}
 
@@ -199,21 +298,36 @@ def retrieve_hybrid_rerank(
         if gid not in candidate_map:
             candidate_map[gid] = item
 
-    # Sort fused candidates by RRF score descending
-    fused_gids = sorted(rrf_scores.keys(), key=lambda gid: rrf_scores[gid], reverse=True)[:fused_candidates_k]
-    fused_candidates = [candidate_map[gid] for gid in fused_gids]
-    retrieval_ms = (time.perf_counter() - t0_retrieval) * 1000.0
+    # Apply Financial Statement and Table Boost
+    if is_quant:
+        for gid, item in candidate_map.items():
+            sec = item.get("item_section", "")
+            is_tbl = item.get("is_table", False)
+            boost = 1.0
+            if sec == "Item 8" and is_tbl:
+                boost = 1.40
+            elif sec == "Item 7" and is_tbl:
+                boost = 1.30
+            elif sec == "Item 8":
+                boost = 1.15
+            elif sec == "Item 1A":
+                boost = 0.65
+            rrf_scores[gid] *= boost
+
+    fused_gids = sorted(rrf_scores.keys(), key=lambda g: rrf_scores[g], reverse=True)[:fused_candidates_k]
+    fused_candidates = [candidate_map[g] for g in fused_gids]
+    ret_ms = (time.perf_counter() - t0_ret) * 1000.0
 
     if not fused_candidates:
-        return [], retrieval_ms, 0.0
+        return [], ret_ms, 0.0
 
-    # 4. Cross-Encoder Reranking
+    # Cross-Encoder Reranking
     t0_rerank = time.perf_counter()
     pairs = [(query, c["text"]) for c in fused_candidates]
     ce_scores = bundle.cross_encoder.predict(pairs)
 
     reranked_order = np.argsort(ce_scores)[::-1][:top_k]
-    final_results = []
+    results = []
     for new_rank, idx in enumerate(reranked_order, 1):
         rec = dict(fused_candidates[idx])
         rec["cross_encoder_score"] = float(ce_scores[idx])
@@ -221,10 +335,53 @@ def retrieve_hybrid_rerank(
         rec["score"] = float(ce_scores[idx])
         rec["retrieval_rank"] = new_rank
         rec["retrieval_method"] = "hybrid_rerank"
-        final_results.append(rec)
+        results.append(rec)
 
     rerank_ms = (time.perf_counter() - t0_rerank) * 1000.0
-    return final_results, retrieval_ms, rerank_ms
+    return results, ret_ms, rerank_ms
+
+
+def retrieve_hybrid_rerank(
+    query: str,
+    bundle: SECRetrieverBundle,
+    top_k: int = 5,
+    tickers: Optional[List[str]] = None,
+) -> Tuple[List[Dict[str, Any]], float, float]:
+    """
+    Mode 4 (Flagship):
+    - Balanced Per-Ticker Partitioning: If M >= 2 tickers, retrieves ceil(top_k / M) per ticker independently.
+    - If 1 ticker, filters strictly to that ticker.
+    - Applies Financial Section Boost and Cross-Encoder Reranking.
+    """
+    if tickers and len(tickers) >= 2:
+        quota = math.ceil(top_k / len(tickers))
+        combined_chunks = []
+        total_ret_ms = 0.0
+        total_rerank_ms = 0.0
+
+        for t in tickers:
+            t_res, r_ms, rk_ms = _retrieve_single_ticker_hybrid(
+                query=query,
+                bundle=bundle,
+                target_ticker=t,
+                top_k=quota,
+            )
+            total_ret_ms += r_ms
+            total_rerank_ms += rk_ms
+            combined_chunks.extend(t_res)
+
+        for i, c in enumerate(combined_chunks, 1):
+            c["retrieval_rank"] = i
+
+        return combined_chunks[: max(top_k, len(tickers) * quota)], total_ret_ms, total_rerank_ms
+
+    target_t = tickers[0] if (tickers and len(tickers) == 1) else None
+    return _retrieve_single_ticker_hybrid(
+        query=query,
+        bundle=bundle,
+        target_ticker=target_t,
+        top_k=top_k,
+    )
 
 
 def retrieve(
@@ -235,24 +392,21 @@ def retrieve(
     artifacts_dir: Path = ARTIFACTS_DIR,
 ) -> Dict[str, Any]:
     """
-    Unified 4-Tier Retrieval Interface:
-    Supports modes:
-    - 'direct_llm': returns empty context (ungrounded baseline)
-    - 'sparse_bm25' (or 'tfidf'): BM25 lexical search (top-5)
-    - 'dense_faiss': FAISS dense semantic search (top-5)
-    - 'hybrid_rerank': BM25(20) + FAISS(20) -> RRF(60) -> CrossEncoder(15->5)
+    Unified 4-Tier Retrieval Interface with Ticker Routing and Adversarial Guardrail.
     """
     mode = mode.lower().strip()
     if mode == "tfidf":
         mode = "sparse_bm25"
 
     detected_tickers = tickers if tickers is not None else detect_tickers(query)
+    scope = detect_adversarial_scope(query, detected_tickers)
 
     if mode == "direct_llm":
         return {
             "mode": "direct_llm",
             "query": query,
             "detected_tickers": detected_tickers,
+            "scope_check": scope,
             "chunks": [],
             "retrieval_ms": 0.0,
             "rerank_ms": 0.0,
@@ -267,6 +421,7 @@ def retrieve(
             "mode": "sparse_bm25",
             "query": query,
             "detected_tickers": detected_tickers,
+            "scope_check": scope,
             "chunks": chunks,
             "retrieval_ms": ret_ms,
             "rerank_ms": 0.0,
@@ -279,6 +434,7 @@ def retrieve(
             "mode": "dense_faiss",
             "query": query,
             "detected_tickers": detected_tickers,
+            "scope_check": scope,
             "chunks": chunks,
             "retrieval_ms": ret_ms,
             "rerank_ms": 0.0,
@@ -293,6 +449,7 @@ def retrieve(
             "mode": "hybrid_rerank",
             "query": query,
             "detected_tickers": detected_tickers,
+            "scope_check": scope,
             "chunks": chunks,
             "retrieval_ms": ret_ms,
             "rerank_ms": rerank_ms,

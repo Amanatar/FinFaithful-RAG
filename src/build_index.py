@@ -32,6 +32,11 @@ try:
 except ImportError:
     from .sec_parser import chunk_section, parse_and_save_filing
 
+try:
+    from ticker_lookup import get_cik
+except ImportError:
+    from .ticker_lookup import get_cik
+
 PROCESSED_10K_DIR = REPO_ROOT / "data" / "processed_10k"
 RAW_10K_DIR = REPO_ROOT / "data" / "raw_10k"
 LEGACY_TEXT_DIR = REPO_ROOT / "data" / "processed" / "sec_text"
@@ -40,6 +45,32 @@ OUTPUT_DIR = REPO_ROOT / "outputs"
 
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def reparse_raw_filings(raw_dir: Path = RAW_10K_DIR, processed_dir: Path = PROCESSED_10K_DIR) -> int:
+    """Parses all raw 10-K HTML files into structured JSON with updated table contextualization."""
+    raw_files = sorted(raw_dir.glob("*.html"))
+    if not raw_files:
+        print(f"⚠️ No raw HTML files found in {raw_dir}")
+        return 0
+
+    print(f"🔄 Re-parsing {len(raw_files)} raw HTML filings with upgraded table contextualization...")
+    count = 0
+    for f in raw_files:
+        ticker = f.stem.split("_")[0]
+        filing_date = f.stem.split("_")[1] if "_" in f.stem else "2026-11-03"
+        cik = get_cik(ticker)
+        print(f"   Parsing {ticker} ({filing_date})...")
+        parse_and_save_filing(
+            raw_html_path=f,
+            ticker=ticker,
+            filing_date=filing_date,
+            output_dir=processed_dir,
+            cik=cik,
+        )
+        count += 1
+    print(f"✅ Successfully re-parsed {count} filings into {processed_dir}")
+    return count
 
 
 def tokenize_for_bm25(text: str) -> List[str]:
@@ -271,7 +302,11 @@ if __name__ == "__main__":
     parser.add_argument("--artifacts-dir", default=str(ARTIFACTS_DIR), help="Path to write index bundle")
     parser.add_argument("--output-dir", default=str(OUTPUT_DIR), help="Path to write legacy outputs")
     parser.add_argument("--model", default="all-MiniLM-L6-v2", help="SentenceTransformer model name")
+    parser.add_argument("--reparse", action="store_true", help="Re-parse raw HTML filings before building index")
     args = parser.parse_args()
+
+    if args.reparse:
+        reparse_raw_filings(RAW_10K_DIR, Path(args.data_dir))
 
     build(
         data_dir=Path(args.data_dir),

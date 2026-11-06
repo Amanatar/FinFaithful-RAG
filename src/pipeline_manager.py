@@ -185,12 +185,18 @@ def query_pipeline(
         from .generator import generate
 
     ret_res = retrieve(query=query, mode=mode, top_k=top_k, tickers=ticker_filter)
-    gen_res = generate(query=query, retrieved_chunks=ret_res["chunks"], mode=mode)
+    gen_res = generate(
+        query=query,
+        retrieved_chunks=ret_res["chunks"],
+        mode=mode,
+        scope_check=ret_res.get("scope_check"),
+    )
 
     return {
         "query": query,
         "mode": mode,
         "detected_tickers": ret_res["detected_tickers"],
+        "scope_check": ret_res.get("scope_check"),
         "retrieved_chunks": ret_res["chunks"],
         "retrieval_latency_ms": ret_res["retrieval_ms"],
         "rerank_latency_ms": ret_res["rerank_ms"],

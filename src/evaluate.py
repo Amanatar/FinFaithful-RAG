@@ -1,13 +1,13 @@
 """
-FinFaithful-RAG: Empirical Evaluation Engine & Metrics Calculator (Phase 4)
+FinFaithful-RAG: Empirical Evaluation Engine & Metrics Calculator (Phase 4 / Phase 4.5)
 
-Computes objective non-LLM metrics and deterministic LLM Judge scores:
-  1. Recall@5 & MRR@10 against gold_chunk_ids (Categories A-C)
-  2. Numeric Fact Coverage % (normalized numeric regex matching against key_numbers)
-  3. Citation Validity % & Phantom Citation Detection
+Computes objective non-LLM metrics and independent LLM Judge scores:
+  1. Recall@5 & MRR@10 against gold_chunk_ids (strictly Categories A-C; Category D reports N/A)
+  2. Numeric Fact Coverage % (normalized numeric regex matching against key_numbers; Category D reports N/A)
+  3. Citation Validity % (0.0% for direct_llm; handles phantom citations cleanly)
   4. Trap Abstention Accuracy % on Category D (adversarial_unanswerable)
   5. Retrieval Latency (P50 / P95 ms) & End-to-End Latency (P50 s)
-  6. Deterministic LLM Judge (faithfulness_score 1-5, relevance_score 1-5)
+  6. Independent LLM Judge with structured JSON output, concise prompt (~500 tokens), and <think> stripping
 """
 
 import json
@@ -24,17 +24,20 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
-load_dotenv()
+from llm_client import assert_live_models, resolve_judge_llm, strip_think_blocks
+
+load_dotenv(override=True)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = REPO_ROOT / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-
-DEFAULT_NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
-DEFAULT_NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "meta/llama-3.1-70b-instruct")
 
 
 # =============================================================================
@@ -43,34 +46,58 @@ DEFAULT_NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "meta/llama-3.1-70b-instruct")
 
 def normalize_number_str(num_str: str) -> str:
     """Strips currency symbols, commas, percent signs, and whitespace."""
-    return re.sub(r"[\$,\s\%]", "", str(num_str)).lower()
+    s = re.sub(r"[\$,\s\%]", "", str(num_str)).lower()
+    s = re.sub(r"\.0+$", "", s)
+    return s
 
 
-def calculate_numeric_fact_coverage(key_numbers: List[str], answer: str) -> float:
+def calculate_numeric_fact_coverage(
+    key_numbers: List[str],
+    answer: str,
+    is_trap: bool = False,
+) -> Optional[float]:
     """
     Computes the fraction of key numbers from the ground truth present in the answer.
-    Returns 1.0 if key_numbers is empty (e.g. Category D adversarial traps).
+    Returns None for Category D (adversarial traps) where no facts should be covered.
+    Uses normalized comparison (stripping commas, $, trailing decimals) to avoid false negative drops.
     """
-    if not key_numbers:
-        return 1.0
+    if is_trap or not key_numbers:
+        return None
 
-    ans_norm = normalize_number_str(answer)
+    clean_ans = strip_think_blocks(answer)
+    ans_norm = re.sub(r"(?<=\d),(?=\d)", "", clean_ans)
+    ans_clean = normalize_number_str(ans_norm)
     hits = 0
 
     for num in key_numbers:
-        # 1. Exact substring check
-        if num in answer:
+        num_str = str(num).strip()
+        norm_num = normalize_number_str(num_str)
+
+        # 1. Exact substring check in raw answer
+        if num_str in clean_ans:
             hits += 1
             continue
+
         # 2. Normalized check (ignoring commas, $, %)
-        norm_num = normalize_number_str(num)
-        if norm_num and norm_num in ans_norm:
+        if norm_num and norm_num in ans_clean:
             hits += 1
             continue
+
         # 3. Numeric decimal check (e.g., "214.4 billion" -> "214.4")
-        num_clean = re.sub(r"[^\d\.]", "", num)
-        if num_clean and num_clean in answer:
+        num_clean = re.sub(r"[^\d\.]", "", num_str)
+        num_clean = re.sub(r"\.0+$", "", num_clean)
+        if num_clean and (num_clean in clean_ans or num_clean in ans_clean):
             hits += 1
+            continue
+
+        # 4. Formatted integer check (e.g. 53809 in key_nums vs 53,809 in answer)
+        try:
+            val = float(num_clean)
+            if f"{int(val):,}" in clean_ans:
+                hits += 1
+                continue
+        except Exception:
+            pass
 
     return hits / len(key_numbers)
 
@@ -79,15 +106,16 @@ def calculate_recall_at_k(
     gold_chunk_ids: List[str],
     retrieved_chunk_ids: List[str],
     k: int = 5,
-) -> float:
+    is_trap: bool = False,
+) -> Optional[float]:
     """
     Computes Recall@K: proportion of gold chunks retrieved in the top-K chunks.
-    For Category D (unanswerable), returns 1.0 if no chunks were required.
+    For Category D (unanswerable traps), returns None as gold chunks do not exist.
     """
-    if not gold_chunk_ids:
-        return 1.0
-    top_k_retrieved = set(retrieved_chunk_ids[:k])
-    hits = sum(1 for gid in gold_chunk_ids if gid in top_k_retrieved)
+    if is_trap or not gold_chunk_ids:
+        return None
+    top_k_retrieved = {cid.lower() for cid in retrieved_chunk_ids[:k]}
+    hits = sum(1 for gid in gold_chunk_ids if gid.lower() in top_k_retrieved)
     return hits / len(gold_chunk_ids)
 
 
@@ -95,28 +123,29 @@ def calculate_mrr_at_k(
     gold_chunk_ids: List[str],
     retrieved_chunk_ids: List[str],
     k: int = 10,
-) -> float:
+    is_trap: bool = False,
+) -> Optional[float]:
     """
     Computes Mean Reciprocal Rank (MRR@K): reciprocal rank of first gold chunk.
-    Returns 1.0 for Category D (unanswerable).
+    Returns None for Category D (unanswerable traps).
     """
-    if not gold_chunk_ids:
-        return 1.0
-    gold_set = set(gold_chunk_ids)
+    if is_trap or not gold_chunk_ids:
+        return None
+    gold_set_lower = {gid.lower() for gid in gold_chunk_ids}
     for rank, cid in enumerate(retrieved_chunk_ids[:k], 1):
-        if cid in gold_set:
+        if cid.lower() in gold_set_lower:
             return 1.0 / rank
     return 0.0
 
 
 # =============================================================================
-# DETERMINISTIC LLM JUDGE
+# DETERMINISTIC INDEPENDENT LLM JUDGE
 # =============================================================================
 
 JUDGE_PROMPT_TEMPLATE = """You are a rigorous, skeptical Senior Financial NLP Auditor grading an AI RAG answer.
-Score the answer strictly from 1 to 5 on two criteria:
+Score the answer strictly on two criteria:
 
-1. Faithfulness Score (1 to 5):
+1. Faithfulness Score (integer 1 to 5):
    - 5 = 100% supported by the retrieved SEC 10-K context chunks. Every figure and fact is present in context.
    - 4 = Grounded in context with minor non-material phrasing additions.
    - 3 = Partially supported, but introduces unverified claims or secondary numbers not in context.
@@ -124,7 +153,7 @@ Score the answer strictly from 1 to 5 on two criteria:
    - 1 = Hallucinated figures, contradicted 10-K data, or fabricated guidance on unanswerable traps.
    * NOTE: For an unanswerable trap where no evidence exists, properly abstaining with [INSUFFICIENT_FILING_EVIDENCE] MUST receive a 5.
 
-2. Relevance Score (1 to 5):
+2. Relevance Score (integer 1 to 5):
    - 5 = Directly answers the specific financial question asked, or properly abstains on unanswerable traps.
    - 4 = Answers the question with slight verbosity or minor omission of secondary context.
    - 3 = Partially answers the question or answers an adjacent financial metric.
@@ -139,29 +168,30 @@ Expected Ground Truth: {ground_truth}
 AI Answer: {answer}
 
 Respond ONLY with a JSON object in this exact schema:
-{{"faithfulness_score": <1-5>, "relevance_score": <1-5>, "reason": "<concise audit reason>"}}
+{{"faithfulness_score": <1-5>, "relevance_score": <1-5>, "rationale": "<concise audit reason>"}}
 """
 
 
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=6),
-    reraise=False,
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=2.0, min=3, max=30),
+    reraise=True,
 )
 def _call_judge_llm(
     judge_prompt: str,
     client: OpenAI,
-    model: str = DEFAULT_NVIDIA_MODEL,
-) -> Optional[str]:
+    model: str,
+) -> str:
     response = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": judge_prompt}],
         temperature=0.0,
-        top_p=1.0,
-        response_format={"type": "json_object"},
-        timeout=20,
+        max_tokens=350,
     )
-    return response.choices[0].message.content
+    raw = response.choices[0].message.content or ""
+    if not raw and getattr(response.choices[0].message, "reasoning", ""):
+        raw = response.choices[0].message.reasoning
+    return strip_think_blocks(raw)
 
 
 def judge_answer(
@@ -169,102 +199,49 @@ def judge_answer(
     answer: str,
     context_chunks: List[Dict[str, Any]],
     item: Dict[str, Any],
-    client: Optional[OpenAI] = None,
 ) -> Dict[str, Any]:
     """
-    Evaluates faithfulness and relevance via deterministic LLM Judge or deterministic fallback.
+    Evaluates faithfulness and relevance via independent live LLM Judge.
+    Uses resolve_judge_llm() to guarantee consistent evaluation on the locked judge endpoint.
     """
-    is_trap = item.get("must_abstain", False)
-    has_abstention = "[INSUFFICIENT_FILING_EVIDENCE]" in answer
+    clean_ans = strip_think_blocks(answer)
+    client, provider_name, model_id = resolve_judge_llm()
 
-    # Check if live NVIDIA NIM LLM Judge is usable
-    api_key = os.getenv("NVIDIA_API_KEY", "")
-    if client and api_key and not api_key.startswith("nvapi-placeholder") and len(api_key) > 10:
-        context_str = "\n".join(
-            [f"[{c.get('ticker')}|Chunk {c.get('chunk_id')}]: {c.get('text', '')[:300]}" for c in context_chunks]
-        ) or "NO RETRIEVED CONTEXT."
-        prompt = JUDGE_PROMPT_TEMPLATE.format(
-            context_str=context_str,
-            question=question,
-            ground_truth=item.get("ground_truth_answer", ""),
-            answer=answer,
-        )
-        try:
-            raw_json = _call_judge_llm(prompt, client)
-            if raw_json:
-                data = json.loads(raw_json)
-                return {
-                    "faithfulness_score": float(data.get("faithfulness_score", 3.0)),
-                    "relevance_score": float(data.get("relevance_score", 3.0)),
-                    "judge_reason": data.get("reason", "Live LLM Judge evaluated"),
-                    "judge_engine": "nvidia_nim_llm_judge",
-                }
-        except Exception:
-            pass
+    # Concise context formatting (~200 chars per chunk to keep judge prompt compact)
+    context_str = "\n".join(
+        [f"[{c.get('ticker')}|Chunk {c.get('chunk_id')}]: {c.get('text', '')[:200]}" for c in context_chunks[:5]]
+    ) or "NO RETRIEVED CONTEXT."
 
-    # Deterministic Rule-Based Auditor Fallback
-    # 1. Category D (Adversarial Trap)
-    if is_trap:
-        if has_abstention:
-            return {
-                "faithfulness_score": 5.0,
-                "relevance_score": 5.0,
-                "judge_reason": "Clean abstention on unanswerable filing trap [INSUFFICIENT_FILING_EVIDENCE].",
-                "judge_engine": "deterministic_auditor",
-            }
-        else:
-            return {
-                "faithfulness_score": 1.0,
-                "relevance_score": 1.0,
-                "judge_reason": "Severe failure: Model hallucinated or invented numbers on an unanswerable trap.",
-                "judge_engine": "deterministic_auditor",
-            }
+    prompt = JUDGE_PROMPT_TEMPLATE.format(
+        context_str=context_str,
+        question=question,
+        ground_truth=item.get("ground_truth_answer", ""),
+        answer=clean_ans,
+    )
 
-    # 2. Categories A, B, C (Answerable)
-    if not context_chunks:
-        # Direct LLM mode without context
-        cov = calculate_numeric_fact_coverage(item.get("key_numbers", []), answer)
+    try:
+        raw_output = _call_judge_llm(prompt, client, model=model_id)
+        clean_json_str = re.sub(r"^```(?:json)?\s*", "", raw_output.strip())
+        clean_json_str = re.sub(r"\s*```$", "", clean_json_str.strip())
+        match = re.search(r"\{.*\}", clean_json_str, re.DOTALL)
+        if match:
+            clean_json_str = match.group(0)
+
+        data = json.loads(clean_json_str)
+        f_score = float(data.get("faithfulness_score", 3.0))
+        r_score = float(data.get("relevance_score", 3.0))
+        f_score = max(1.0, min(5.0, f_score))
+        r_score = max(1.0, min(5.0, r_score))
+        rationale = data.get("rationale", data.get("reason", "Live LLM Judge evaluated"))
+
         return {
-            "faithfulness_score": 1.5,
-            "relevance_score": 2.5 + (2.0 * cov),
-            "judge_reason": "Direct LLM has zero retrieved 10-K context; answer lacks verified filing citations.",
-            "judge_engine": "deterministic_auditor",
+            "faithfulness_score": f_score,
+            "relevance_score": r_score,
+            "judge_reason": rationale,
+            "judge_engine": f"live_judge:{provider_name}:{model_id}",
         }
-
-    # Grounded RAG modes
-    key_nums = item.get("key_numbers", [])
-    cov = calculate_numeric_fact_coverage(key_nums, answer)
-    raw_citations = re.findall(r"\[([^\]]+)\]", answer)
-    has_valid_tag = any("|" in cit for cit in raw_citations)
-
-    # Faithfulness calculation
-    if cov >= 0.99 and has_valid_tag:
-        f_score = 5.0
-        f_reason = "100% verified numbers present and supported by retrieved chunks."
-    elif cov >= 0.5:
-        f_score = 4.0
-        f_reason = "Grounded in context with partial line-item extraction."
-    elif cov > 0:
-        f_score = 3.0
-        f_reason = "Contains some numbers from context, but incomplete."
-    else:
-        f_score = 2.5
-        f_reason = "Grounded narrative text present, but key financial figures omitted."
-
-    # Relevance calculation
-    if cov >= 0.99:
-        r_score = 5.0
-    elif cov >= 0.5:
-        r_score = 4.0
-    else:
-        r_score = 3.0
-
-    return {
-        "faithfulness_score": f_score,
-        "relevance_score": r_score,
-        "judge_reason": f_reason,
-        "judge_engine": "deterministic_auditor",
-    }
+    except Exception as e:
+        raise RuntimeError(f"Live LLM Judge failed ({type(e).__name__}: {e})")
 
 
 # =============================================================================
@@ -274,30 +251,29 @@ def judge_answer(
 def evaluate_single_run(
     item: Dict[str, Any],
     pipeline_result: Dict[str, Any],
-    judge_client: Optional[OpenAI] = None,
 ) -> Dict[str, Any]:
     """
     Evaluates a single benchmark item run, computing all objective metrics
-    and judge scores. Returns a structured dictionary ready for JSONL persistence.
+    and live independent judge scores. Returns a structured dictionary ready for JSONL persistence.
     """
     mode = pipeline_result["mode"]
-    answer = pipeline_result["answer"]
+    answer = strip_think_blocks(pipeline_result["answer"])
     retrieved_chunks = pipeline_result.get("retrieved_chunks", [])
     retrieved_cids = [c["global_chunk_id"] for c in retrieved_chunks]
     gold_cids = item.get("gold_chunk_ids", [])
     key_nums = item.get("key_numbers", [])
     is_trap = item.get("must_abstain", False)
 
-    # 1. Retrieval Metrics
+    # 1. Retrieval Metrics (Only for answerable Categories A-C)
     if mode == "direct_llm":
-        recall_at_5 = 0.0
-        mrr_at_10 = 0.0
+        recall_at_5 = 0.0 if not is_trap else None
+        mrr_at_10 = 0.0 if not is_trap else None
     else:
-        recall_at_5 = calculate_recall_at_k(gold_cids, retrieved_cids, k=5)
-        mrr_at_10 = calculate_mrr_at_k(gold_cids, retrieved_cids, k=10)
+        recall_at_5 = calculate_recall_at_k(gold_cids, retrieved_cids, k=5, is_trap=is_trap)
+        mrr_at_10 = calculate_mrr_at_k(gold_cids, retrieved_cids, k=10, is_trap=is_trap)
 
-    # 2. Fact Coverage
-    fact_coverage = calculate_numeric_fact_coverage(key_nums, answer)
+    # 2. Fact Coverage (Only for answerable Categories A-C)
+    fact_coverage = calculate_numeric_fact_coverage(key_nums, answer, is_trap=is_trap)
 
     # 3. Citation Audit
     audit = pipeline_result.get("citation_audit", {})
@@ -305,10 +281,14 @@ def evaluate_single_run(
     phantom_cits = audit.get("phantom_citations", [])
     total_cits = audit.get("total_citations_found", 0)
 
-    if total_cits > 0:
+    # Direct LLM has zero retrieved context, so citation validity is strictly 0.0%
+    if mode == "direct_llm":
+        citation_validity = 0.0
+    elif total_cits > 0:
         citation_validity = len(valid_cits) / total_cits
     else:
-        citation_validity = 1.0 if (is_trap or mode == "direct_llm") else 0.0
+        # Category D trap cleanly abstaining without citations has valid citation behavior
+        citation_validity = 1.0 if is_trap else 0.0
 
     has_phantom = len(phantom_cits) > 0
     has_abstention = "[INSUFFICIENT_FILING_EVIDENCE]" in answer
@@ -317,18 +297,19 @@ def evaluate_single_run(
     if is_trap:
         abstention_accuracy = 1.0 if has_abstention else 0.0
     else:
-        abstention_accuracy = 1.0  # Answerable items not penalized by trap abstention
+        abstention_accuracy = 1.0
 
     # 5. Judge Scores
+    t_judge_0 = time.perf_counter()
     judge_res = judge_answer(
         question=item["question"],
         answer=answer,
         context_chunks=retrieved_chunks[:5],
         item=item,
-        client=judge_client,
     )
+    judge_latency_ms = (time.perf_counter() - t_judge_0) * 1000.0
 
-    total_latency_ms = pipeline_result.get("total_latency_ms", 0.0)
+    total_latency_ms = pipeline_result.get("total_latency_ms", 0.0) + judge_latency_ms
 
     return {
         "question_id": item["question_id"],
@@ -343,9 +324,9 @@ def evaluate_single_run(
         "gold_chunk_ids": gold_cids,
         "retrieved_chunk_ids": retrieved_cids[:10],
         "top_5_chunk_ids": retrieved_cids[:5],
-        "recall_at_5": round(recall_at_5, 4),
-        "mrr_at_10": round(mrr_at_10, 4),
-        "numeric_fact_coverage": round(fact_coverage, 4),
+        "recall_at_5": round(recall_at_5, 4) if recall_at_5 is not None else None,
+        "mrr_at_10": round(mrr_at_10, 4) if mrr_at_10 is not None else None,
+        "numeric_fact_coverage": round(fact_coverage, 4) if fact_coverage is not None else None,
         "citation_validity": round(citation_validity, 4),
         "has_phantom_citations": has_phantom,
         "has_abstention": has_abstention,
@@ -357,6 +338,7 @@ def evaluate_single_run(
         "retrieval_latency_ms": round(pipeline_result.get("retrieval_latency_ms", 0.0), 2),
         "rerank_latency_ms": round(pipeline_result.get("rerank_latency_ms", 0.0), 2),
         "generation_latency_ms": round(pipeline_result.get("generation_latency_ms", 0.0), 2),
+        "judge_latency_ms": round(judge_latency_ms, 2),
         "total_latency_ms": round(total_latency_ms, 2),
         "total_latency_s": round(total_latency_ms / 1000.0, 3),
         "answer": answer,
@@ -384,26 +366,35 @@ def aggregate_evaluation_results(
         if df_m.empty:
             continue
 
-        # Split answerable vs trap
         df_answerable = df_m[df_m["category"] != "adversarial_unanswerable"]
         df_trap = df_m[df_m["category"] == "adversarial_unanswerable"]
+
+        rec_series = df_answerable["recall_at_5"].dropna()
+        mrr_series = df_answerable["mrr_at_10"].dropna()
+        cov_series = df_answerable["numeric_fact_coverage"].dropna()
+
+        mean_rec = float(rec_series.mean()) if not rec_series.empty else 0.0
+        mean_mrr = float(mrr_series.mean()) if not mrr_series.empty else 0.0
+        mean_cov = float(cov_series.mean()) * 100.0 if not cov_series.empty else 0.0
+
+        cit_val = 0.0 if m == "direct_llm" else round(float(df_m["citation_validity"].mean()) * 100.0, 2)
+        trap_acc = round(float(df_trap["abstention_accuracy"].dropna().mean()) * 100.0, 2) if not df_trap.empty else 100.0
 
         summary[m] = {
             "total_questions": len(df_m),
             "mean_faithfulness": round(float(df_m["faithfulness_score"].mean()), 2),
             "mean_relevance": round(float(df_m["relevance_score"].mean()), 2),
-            "mean_recall_at_5": round(float(df_answerable["recall_at_5"].mean()), 4) if not df_answerable.empty else 0.0,
-            "mean_mrr_at_10": round(float(df_answerable["mrr_at_10"].mean()), 4) if not df_answerable.empty else 0.0,
-            "numeric_fact_coverage_pct": round(float(df_answerable["numeric_fact_coverage"].mean()) * 100.0, 2) if not df_answerable.empty else 0.0,
-            "citation_validity_pct": round(float(df_m["citation_validity"].mean()) * 100.0, 2),
+            "mean_recall_at_5": round(mean_rec, 4),
+            "mean_mrr_at_10": round(mean_mrr, 4),
+            "numeric_fact_coverage_pct": round(mean_cov, 2),
+            "citation_validity_pct": cit_val,
             "phantom_citations_count": int(df_m["has_phantom_citations"].sum()),
-            "trap_abstention_accuracy_pct": round(float(df_trap["abstention_accuracy"].mean()) * 100.0, 2) if not df_trap.empty else 100.0,
+            "trap_abstention_accuracy_pct": trap_acc,
             "retrieval_latency_p50_ms": round(float(np.percentile(df_m["retrieval_latency_ms"], 50)), 1),
             "retrieval_latency_p95_ms": round(float(np.percentile(df_m["retrieval_latency_ms"], 95)), 1),
             "end_to_end_latency_p50_s": round(float(np.percentile(df_m["total_latency_s"], 50)), 3),
         }
 
-    # Per-Category Breakdown Table
     breakdown_rows = []
     categories = [
         "table_numeric",
@@ -413,10 +404,22 @@ def aggregate_evaluation_results(
     ]
 
     for cat in categories:
+        is_adv = (cat == "adversarial_unanswerable")
         for m in modes:
             sub = df[(df["category"] == cat) & (df["mode"] == m)]
             if sub.empty:
                 continue
+
+            rec_series = sub["recall_at_5"].dropna()
+            mrr_series = sub["mrr_at_10"].dropna()
+            cov_series = sub["numeric_fact_coverage"].dropna()
+
+            rec_val = round(float(rec_series.mean()), 4) if (not is_adv and not rec_series.empty) else None
+            mrr_val = round(float(mrr_series.mean()), 4) if (not is_adv and not mrr_series.empty) else None
+            fact_cov_val = round(float(cov_series.mean()) * 100.0, 2) if (not is_adv and not cov_series.empty) else None
+            cit_val_sub = 0.0 if m == "direct_llm" else round(float(sub["citation_validity"].mean()) * 100.0, 2)
+            abst_val = round(float(sub["abstention_accuracy"].dropna().mean()) * 100.0, 2) if is_adv else 100.0
+
             breakdown_rows.append(
                 {
                     "category": cat,
@@ -424,11 +427,11 @@ def aggregate_evaluation_results(
                     "count": len(sub),
                     "faithfulness": round(float(sub["faithfulness_score"].mean()), 2),
                     "relevance": round(float(sub["relevance_score"].mean()), 2),
-                    "recall_at_5": round(float(sub["recall_at_5"].mean()), 4),
-                    "mrr_at_10": round(float(sub["mrr_at_10"].mean()), 4),
-                    "fact_coverage_pct": round(float(sub["numeric_fact_coverage"].mean()) * 100.0, 2),
-                    "citation_validity_pct": round(float(sub["citation_validity"].mean()) * 100.0, 2),
-                    "abstention_acc_pct": round(float(sub["abstention_accuracy"].mean()) * 100.0, 2),
+                    "recall_at_5": rec_val,
+                    "mrr_at_10": mrr_val,
+                    "fact_coverage_pct": fact_cov_val,
+                    "citation_validity_pct": cit_val_sub,
+                    "abstention_acc_pct": abst_val,
                     "p50_latency_ms": round(float(np.percentile(sub["total_latency_ms"], 50)), 1),
                 }
             )

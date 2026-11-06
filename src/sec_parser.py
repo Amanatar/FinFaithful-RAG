@@ -3,7 +3,6 @@ import os
 import re
 import sys
 from pathlib import Path
-
 from typing import Any, Dict, List, Optional, Tuple
 import warnings
 
@@ -16,10 +15,17 @@ if sys.platform == "win32":
 
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
-
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 CURRENCY_SYMBOLS = {"$", "€", "£", "¥", "₹"}
+
+COMPANY_NAME_MAP = {
+    "AAPL": "Apple Inc.",
+    "MSFT": "Microsoft Corporation",
+    "NVDA": "NVIDIA Corporation",
+    "JPM": "JPMorgan Chase & Co.",
+    "GOOGL": "Alphabet Inc.",
+}
 
 HIGH_SIGNAL_SECTIONS = [
     ("Item 1", "Business", r"(?:\n|\A)\s*(?:PART\s+I\s+)?Item\s+1[.\s–—\-]+Business\b"),
@@ -34,6 +40,20 @@ HIGH_SIGNAL_SECTIONS = [
 ]
 
 TARGET_FOCUS_SECTIONS = {"Item 1", "Item 1A", "Item 7", "Item 7A", "Item 8"}
+
+STATEMENT_PATTERNS = [
+    r"CONSOLIDATED\s+STATEMENTS?\s+OF\s+OPERATIONS",
+    r"CONSOLIDATED\s+STATEMENTS?\s+OF\s+(?:INCOME|EARNINGS)",
+    r"CONSOLIDATED\s+BALANCE\s+SHEETS?",
+    r"CONSOLIDATED\s+STATEMENTS?\s+OF\s+CASH\s+FLOWS?",
+    r"CONSOLIDATED\s+STATEMENTS?\s+OF\s+COMPREHENSIVE\s+INCOME",
+    r"CONSOLIDATED\s+STATEMENTS?\s+OF\s+STOCKHOLDERS[\'’]?\s+EQUITY",
+    r"SEGMENT\s+(?:REVENUE|DISCLOSURE|INFORMATION)",
+    r"REVENUE\s+DISAGGREGATION|DISAGGREGATED\s+REVENUES?",
+    r"NET\s+SALES\s+BY\s+(?:CATEGORY|PRODUCT|REPORTABLE\s+SEGMENT)",
+    r"OPERATING\s+EXPENSES",
+    r"NOTE\s+\d+[\s–—\-]+[A-Za-z\s]+",
+]
 
 
 def clean_table_cells(raw_cells: List[str]) -> List[str]:
@@ -68,8 +88,49 @@ def clean_table_cells(raw_cells: List[str]) -> List[str]:
     return merged
 
 
-def html_table_to_markdown(table_tag) -> Optional[str]:
-    """Converts a BeautifulSoup <table> into a clean pipe-delimited Markdown table."""
+def find_table_title(table_tag) -> str:
+    """Detects the financial statement title or schedule name for a table."""
+    caption = table_tag.find("caption")
+    if caption and caption.get_text(strip=True):
+        return caption.get_text(separator=" ", strip=True).title()
+    if table_tag.get("summary"):
+        return table_tag.get("summary").strip().title()
+
+    first_tr = table_tag.find("tr")
+    if first_tr:
+        cells = [c.get_text(strip=True) for c in first_tr.find_all(["td", "th"]) if c.get_text(strip=True)]
+        if cells and len(cells) <= 2:
+            txt = cells[0]
+            for pat in STATEMENT_PATTERNS:
+                m = re.search(pat, txt, re.IGNORECASE)
+                if m:
+                    return m.group(0).strip().title()
+
+    hops = 0
+    for elem in table_tag.previous_elements:
+        hops += 1
+        if hops > 35:
+            break
+        if elem.name in ["p", "div", "h1", "h2", "h3", "h4", "span", "b", "strong"]:
+            txt = elem.get_text(separator=" ", strip=True)
+            if not txt or len(txt) > 220 or len(txt) < 3:
+                continue
+            for pat in STATEMENT_PATTERNS:
+                m = re.search(pat, txt, re.IGNORECASE)
+                if m:
+                    return m.group(0).strip().title()
+            if re.search(r"(?:table\s+shows|as\s+follows|disaggregated\s+by|revenue\s+by|net\s+sales\s+by)", txt, re.IGNORECASE):
+                clean_title = txt.split("\n")[0][:100].strip()
+                return clean_title.title()
+
+    return "Consolidated Financial Schedule"
+
+
+def html_table_to_markdown(table_tag) -> Tuple[Optional[str], str, List[str], List[str]]:
+    """
+    Converts a BeautifulSoup <table> into clean Markdown.
+    Returns: (markdown_table, title, years, row_labels)
+    """
     rows: List[List[str]] = []
     for tr in table_tag.find_all("tr"):
         cells = [c.get_text(separator=" ", strip=True) for c in tr.find_all(["td", "th"])]
@@ -78,28 +139,24 @@ def html_table_to_markdown(table_tag) -> Optional[str]:
             rows.append(cleaned)
 
     if not rows or len(rows) < 2:
-        return None
+        return None, "", [], []
 
-    # Check that table contains substantive data, not pure navigation or single cell
     max_cols = max(len(r) for r in rows)
     if max_cols < 2:
-        return None
+        return None, "", [], []
 
-    # If header row has fewer columns than max_cols, pad or prepend a label
     header = rows[0]
     if len(header) < max_cols:
         missing = max_cols - len(header)
         header = ["Line Item / Description"] * missing + header
         rows[0] = header
 
-    # Standardize column width across all rows
     standardized = []
     for r in rows:
         if len(r) < max_cols:
             r = r + [""] * (max_cols - len(r))
         elif len(r) > max_cols:
             r = r[:max_cols]
-        # Clean pipes inside cells to avoid breaking markdown syntax
         clean_row = [cell.replace("|", "/") for cell in r]
         standardized.append(clean_row)
 
@@ -107,27 +164,57 @@ def html_table_to_markdown(table_tag) -> Optional[str]:
     sep_line = "| " + " | ".join([":---"] * max_cols) + " |"
     data_lines = ["| " + " | ".join(r) + " |" for r in standardized[1:]]
 
-    return "\n" + "\n".join([header_line, sep_line] + data_lines) + "\n"
+    table_md = "\n" + "\n".join([header_line, sep_line] + data_lines) + "\n"
+
+    title = find_table_title(table_tag)
+    raw_text = table_tag.get_text(separator=" ", strip=True)
+    years = sorted(set(re.findall(r"\b(202[0-9])\b", raw_text)))
+
+    row_labels = []
+    for r in standardized[1:]:
+        if r and r[0].strip():
+            clean_label = re.sub(r"[\$\(\)\,\d\%\:\-\–—/]+", "", r[0]).strip()
+            if len(clean_label) > 2 and clean_label not in row_labels:
+                row_labels.append(clean_label)
+
+    return table_md, title, years, row_labels
 
 
-def split_table_chunks(table_md: str, max_rows: int = 16) -> List[str]:
-    """Splits a large Markdown table across chunks while preserving headers on every chunk."""
+def split_table_chunks(
+    table_md: str,
+    max_rows: int = 16,
+) -> List[Tuple[str, List[str]]]:
+    """
+    Splits a large Markdown table across chunks while preserving headers on every chunk.
+    Returns list of (sub_table_markdown, subchunk_row_labels).
+    """
     lines = [line.strip() for line in table_md.strip().splitlines() if line.strip()]
     if len(lines) <= 2:
-        return [table_md]
+        return [(table_md, [])]
 
     header_line = lines[0]
     sep_line = lines[1] if lines[1].startswith("|") and "---" in lines[1] else "| " + " | ".join([":---"] * (header_line.count("|") - 1)) + " |"
     data_rows = lines[2:] if (len(lines) > 2 and "---" in lines[1]) else lines[1:]
 
+    def get_labels_from_rows(rows_list: List[str]) -> List[str]:
+        lbls = []
+        for r in rows_list:
+            parts = [p.strip() for p in r.split("|") if p.strip()]
+            if parts:
+                lbl = re.sub(r"[\$\(\)\,\d\%\:\-\–—/]+", "", parts[0]).strip()
+                if len(lbl) > 2 and lbl not in lbls:
+                    lbls.append(lbl)
+        return lbls
+
     if len(data_rows) <= max_rows:
-        return [table_md]
+        return [(table_md, get_labels_from_rows(data_rows))]
 
     chunks = []
     for i in range(0, len(data_rows), max_rows):
         sub_rows = data_rows[i : i + max_rows]
         chunk_str = "\n".join([header_line, sep_line] + sub_rows)
-        chunks.append(chunk_str)
+        sub_lbls = get_labels_from_rows(sub_rows)
+        chunks.append((chunk_str, sub_lbls))
     return chunks
 
 
@@ -141,7 +228,6 @@ def chunk_narrative_text(text: str, max_chunk_size: int = 1400, overlap: int = 1
     for line in lines:
         if curr_len + len(line) > max_chunk_size and curr:
             chunks.append(" ".join(curr))
-            # Keep overlap lines
             overlap_lines: List[str] = []
             overlap_len = 0
             for prev_l in reversed(curr):
@@ -153,7 +239,6 @@ def chunk_narrative_text(text: str, max_chunk_size: int = 1400, overlap: int = 1
             curr = overlap_lines + [line]
             curr_len = sum(len(x) for x in curr) + len(curr)
         else:
-            # If a single line itself is longer than max_chunk_size, slice on sentences
             while len(line) > max_chunk_size:
                 split_pt = line[:max_chunk_size].rfind(". ")
                 if split_pt == -1 or split_pt < max_chunk_size // 2:
@@ -175,13 +260,21 @@ def chunk_narrative_text(text: str, max_chunk_size: int = 1400, overlap: int = 1
 
 
 def extract_fiscal_year(html_text: str, default_year: Optional[int] = None) -> int:
-    """Extracts fiscal year from 10-K text or returns default."""
-    m = re.search(r"FOR\s+THE\s+FISCAL\s+YEAR\s+ENDED\s+([A-Za-z]+\s+\d{1,2},\s+(\d{4}))", html_text[:15000], re.IGNORECASE)
+    """Extracts true audited fiscal year from 10-K text / XBRL tags."""
+    # 1. XBRL DocumentFiscalYearFocus
+    m_xbrl = re.search(r"DocumentFiscalYearFocus[^>]*>(\d{4})<", html_text, re.IGNORECASE)
+    if m_xbrl:
+        return int(m_xbrl.group(1))
+
+    # 2. Textual period ended
+    m = re.search(r"FOR\s+THE\s+FISCAL\s+YEAR\s+ENDED\s+([A-Za-z]+\s+\d{1,2},\s+(\d{4}))", html_text[:40000], re.IGNORECASE)
     if m:
         return int(m.group(2))
-    m2 = re.search(r"fiscal\s+year\s+ended\s+.*?(\d{4})", html_text[:30000], re.IGNORECASE)
+
+    m2 = re.search(r"fiscal\s+year\s+ended\s+.*?(\d{4})", html_text[:50000], re.IGNORECASE)
     if m2:
         return int(m2.group(1))
+
     return default_year or 2026
 
 
@@ -195,7 +288,7 @@ def parse_10k_html(
     """
     Parses a Form 10-K HTML filing:
     1. Removes script/style/xbrl boilerplate.
-    2. Converts HTML <table> elements into clean Markdown tables.
+    2. Converts HTML <table> elements into clean Markdown tables with contextual metadata.
     3. Segments the document into standard Item sections (Item 1, 1A, 7, 7A, 8, etc.).
     4. Returns structured section texts and table counts.
     """
@@ -205,14 +298,18 @@ def parse_10k_html(
     for tag in soup.find_all(["script", "style", "noscript", "ix:header"]):
         tag.decompose()
 
-    # Convert tables to markdown placeholders
+    fy = extract_fiscal_year(html_content)
+
+    # Convert tables to markdown placeholders with embedded metadata
     tables = soup.find_all("table")
     preserved_table_count = 0
     for t in tables:
-        md = html_table_to_markdown(t)
+        md, title, years, row_labels = html_table_to_markdown(t)
         if md:
             preserved_table_count += 1
-            t.replace_with(soup.new_string(f"\n\n[FINANCIAL_TABLE_START]\n{md}\n[FINANCIAL_TABLE_END]\n\n"))
+            meta_tag = f"Title={title}###Years={','.join(years)}###Rows={','.join(row_labels[:12])}"
+            placeholder = f"\n\n[FINANCIAL_TABLE_START:{meta_tag}]\n{md}\n[FINANCIAL_TABLE_END]\n\n"
+            t.replace_with(soup.new_string(placeholder))
         else:
             t.replace_with(soup.new_string(" " + t.get_text(separator=" ", strip=True) + " "))
 
@@ -220,10 +317,7 @@ def parse_10k_html(
     full_text = full_text.replace("\xa0", " ").replace("\u200b", "").replace("\u2009", " ")
     full_text = re.sub(r"\n{3,}", "\n\n", full_text)
 
-
-    fy = extract_fiscal_year(full_text[:35000])
-
-    # Detect section boundaries past the Table of Contents (pos > 6000)
+    # Detect section boundaries past Table of Contents (pos > 6000)
     section_matches = []
     for sec_id, sec_title, pat in HIGH_SIGNAL_SECTIONS:
         all_matches = list(re.finditer(pat, full_text, re.IGNORECASE))
@@ -243,7 +337,7 @@ def parse_10k_html(
             if focus_sections_only and sec_id not in TARGET_FOCUS_SECTIONS:
                 continue
 
-            t_count = len(re.findall(r"\[FINANCIAL_TABLE_START\]", sec_body))
+            t_count = len(re.findall(r"\[FINANCIAL_TABLE_START", sec_body))
             sections[sec_id] = {
                 "section_id": sec_id,
                 "section_title": sec_title,
@@ -268,7 +362,7 @@ def parse_10k_html(
                     break
             if focus_sections_only and sec_id not in TARGET_FOCUS_SECTIONS and not sec_id.startswith("Section_"):
                 continue
-            t_count = len(re.findall(r"\[FINANCIAL_TABLE_START\]", p))
+            t_count = len(re.findall(r"\[FINANCIAL_TABLE_START", p))
             sections[sec_id] = {
                 "section_id": sec_id,
                 "section_title": first_line,
@@ -279,8 +373,6 @@ def parse_10k_html(
             }
 
     # Enhanced Resolution for Cross-Referenced Financial Statements (e.g. JPM, NVDA)
-    # When Item 7 or Item 8 only contain cross-reference text ("appears on pages X-Y"),
-    # locate and attach the substantive financial statements and MD&A sections.
     if "Item 7" in sections and sections["Item 7"]["char_length"] < 2500:
         mda_match = re.search(
             r"(?:\n|\A)\s*Management[\'’]?s\s+Discussion\s+and\s+Analysis\b",
@@ -289,7 +381,6 @@ def parse_10k_html(
         )
         if mda_match:
             mda_start = 30000 + mda_match.start()
-            # Stop before Financial Statements
             mda_end_m = re.search(
                 r"(?:\n|\A)\s*(?:Consolidated\s+Financial\s+Statements|Report\s+of\s+Independent)\b",
                 full_text[mda_start + 5000:],
@@ -299,7 +390,7 @@ def parse_10k_html(
             substantive_mda = full_text[mda_start:mda_end].strip()
             if len(substantive_mda) > 5000:
                 combined_mda = sections["Item 7"]["text"] + "\n\n" + substantive_mda
-                t_count = len(re.findall(r"\[FINANCIAL_TABLE_START\]", combined_mda))
+                t_count = len(re.findall(r"\[FINANCIAL_TABLE_START", combined_mda))
                 sections["Item 7"]["text"] = combined_mda
                 sections["Item 7"]["char_length"] = len(combined_mda)
                 sections["Item 7"]["table_count"] = t_count
@@ -321,12 +412,10 @@ def parse_10k_html(
             substantive_fs = full_text[fs_start:fs_end].strip()
             if len(substantive_fs) > 5000:
                 combined_fs = sections["Item 8"]["text"] + "\n\n" + substantive_fs
-                t_count = len(re.findall(r"\[FINANCIAL_TABLE_START\]", combined_fs))
+                t_count = len(re.findall(r"\[FINANCIAL_TABLE_START", combined_fs))
                 sections["Item 8"]["text"] = combined_fs
                 sections["Item 8"]["char_length"] = len(combined_fs)
                 sections["Item 8"]["table_count"] = t_count
-
-
 
     return {
         "ticker": ticker.upper(),
@@ -349,17 +438,17 @@ def chunk_section(
     chunk_overlap: int = 150,
 ) -> List[Dict[str, Any]]:
     """
-    Chunks a 10-K section, preserving Markdown tables with attached headers
-    and prepending the required provenance header to every chunk.
-    Provenance format:
-    [Ticker: {ticker} | Form: 10-K | Fiscal Year: {fy} | Section: {item_section} | Chunk: {chunk_id}]
+    Chunks a 10-K section, preserving Markdown tables with attached replicated headers
+    and prepending dense natural language summaries and provenance headers.
     """
     sec_id = section_data["section_id"]
     sec_title = section_data.get("section_title", sec_id)
     raw_text = section_data["text"]
+    company_name = COMPANY_NAME_MAP.get(ticker, ticker)
 
     chunks_out: List[Dict[str, Any]] = []
-    blocks = re.split(r"(\[FINANCIAL_TABLE_START\].*?\[FINANCIAL_TABLE_END\])", raw_text, flags=re.DOTALL)
+    # Split on table blocks
+    blocks = re.split(r"(\[FINANCIAL_TABLE_START:[^\]]+\]\n.*?\[FINANCIAL_TABLE_END\])", raw_text, flags=re.DOTALL)
     chunk_counter = 0
 
     for block in blocks:
@@ -367,20 +456,50 @@ def chunk_section(
         if not block:
             continue
 
-        if block.startswith("[FINANCIAL_TABLE_START]") and block.endswith("[FINANCIAL_TABLE_END]"):
-            table_md = block.replace("[FINANCIAL_TABLE_START]", "").replace("[FINANCIAL_TABLE_END]", "").strip()
+        if block.startswith("[FINANCIAL_TABLE_START") and block.endswith("[FINANCIAL_TABLE_END]"):
+            # Extract meta tag
+            first_line = block.splitlines()[0]
+            table_title = "Consolidated Financial Schedule"
+            table_years = [str(fiscal_year)]
+            table_rows = []
+
+            m_meta = re.search(r"\[FINANCIAL_TABLE_START:Title=([^#]+)###Years=([^#]*)###Rows=([^\]]*)\]", first_line)
+            if m_meta:
+                table_title = m_meta.group(1).strip()
+                yrs_str = m_meta.group(2).strip()
+                if yrs_str:
+                    table_years = [y.strip() for y in yrs_str.split(",") if y.strip()]
+                rows_str = m_meta.group(3).strip()
+                if rows_str:
+                    table_rows = [r.strip() for r in rows_str.split(",") if r.strip()]
+
+            # Strip start and end tags
+            body_lines = block.splitlines()[1:-1]
+            table_md = "\n".join(body_lines).strip()
+
             table_subchunks = split_table_chunks(table_md, max_rows=16)
-            for sub_table in table_subchunks:
+            for sub_table, sub_row_labels in table_subchunks:
                 chunk_counter += 1
-                prov_header = f"[Ticker: {ticker} | Form: {form} | Fiscal Year: {fiscal_year} | Section: {sec_id} | Chunk: {chunk_counter}]"
-                full_chunk_text = f"{prov_header}\n\n{sub_table}"
+                row_labels_to_use = sub_row_labels if sub_row_labels else table_rows[:8]
+                rows_summary = ", ".join(row_labels_to_use[:8]) if row_labels_to_use else "audited statement line items"
+                years_summary = ", ".join(table_years) if table_years else f"fiscal {fiscal_year}"
+
+                # Dense natural language index summary
+                nl_summary = f"{company_name} ({ticker}) Form 10-K {table_title} table covering {rows_summary} for fiscal periods {years_summary}."
+                prov_header = f"[Ticker: {ticker} | Form: {form} | Fiscal Year: {fiscal_year} | Section: {sec_id} | Statement: {table_title} | Chunk: {chunk_counter}]"
+                full_chunk_text = f"{prov_header}\n{nl_summary}\n\n{sub_table}"
+
                 chunks_out.append({
                     "chunk_id": chunk_counter,
                     "ticker": ticker,
+                    "company_name": company_name,
                     "fiscal_year": fiscal_year,
                     "form": form,
                     "item_section": sec_id,
                     "item_title": sec_title,
+                    "table_title": table_title,
+                    "table_years": table_years,
+                    "table_rows": row_labels_to_use,
                     "is_table": True,
                     "table_count": 1,
                     "char_count": len(full_chunk_text),
@@ -389,7 +508,7 @@ def chunk_section(
                     "text": full_chunk_text,
                 })
         else:
-            clean_narrative = re.sub(r"\[/?FINANCIAL_TABLE_(?:START|END)\]", "", block).strip()
+            clean_narrative = re.sub(r"\[/?FINANCIAL_TABLE_(?:START:[^\]]+|END)\]", "", block).strip()
             if not clean_narrative:
                 continue
 
@@ -397,14 +516,20 @@ def chunk_section(
             for ch in sub_chunks:
                 chunk_counter += 1
                 prov_header = f"[Ticker: {ticker} | Form: {form} | Fiscal Year: {fiscal_year} | Section: {sec_id} | Chunk: {chunk_counter}]"
-                full_chunk_text = f"{prov_header}\n\n{ch}"
+                context_prefix = f"{company_name} ({ticker}) Form 10-K {sec_title}: "
+                full_chunk_text = f"{prov_header}\n{context_prefix}{ch}"
+
                 chunks_out.append({
                     "chunk_id": chunk_counter,
                     "ticker": ticker,
+                    "company_name": company_name,
                     "fiscal_year": fiscal_year,
                     "form": form,
                     "item_section": sec_id,
                     "item_title": sec_title,
+                    "table_title": "",
+                    "table_years": [str(fiscal_year)],
+                    "table_rows": [],
                     "is_table": False,
                     "table_count": 0,
                     "char_count": len(full_chunk_text),
