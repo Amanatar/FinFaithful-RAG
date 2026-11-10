@@ -83,10 +83,10 @@ def resolve_generator_llm() -> Tuple[OpenAI, str, str]:
         client = OpenAI(base_url=base_url, api_key=groq_key, timeout=20)
         groq_gen_candidates = [
             os.getenv("GROQ_GENERATOR_MODEL", ""),
-            "meta-llama/llama-4-scout-17b-16e-instruct",
-            "llama-3.1-8b-instant",
             "qwen/qwen3.8-27b",
             "openai/gpt-oss-120b",
+            "meta-llama/llama-4-scout-17b-16e-instruct",
+            "llama-3.1-8b-instant",
         ]
         for m in [c for c in groq_gen_candidates if c]:
             try:
@@ -134,9 +134,9 @@ def resolve_judge_llm() -> Tuple[OpenAI, str, str]:
         client = OpenAI(base_url=base_url, api_key=groq_key, timeout=20)
         groq_judge_candidates = [
             os.getenv("GROQ_JUDGE_MODEL", ""),
-            "llama-3.1-8b-instant",
             "openai/gpt-oss-20b",
             "openai/gpt-oss-120b",
+            "llama-3.1-8b-instant",
             "allam-2-7b",
         ]
         for m in [c for c in groq_judge_candidates if c]:

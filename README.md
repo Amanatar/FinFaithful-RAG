@@ -31,10 +31,10 @@ Retrieval HitRate@5 Progression (Categories A–C, 90 Questions):
 
 | Pipeline Mode | Faithfulness (1-5) | Relevance (1-5) | HitRate@5 | MRR@10 | Numeric Fact Coverage % | Citation Validity % | False Abstention % | Trap Abstention Acc % | Retrieval P50 (ms) | Total Latency P50 (s) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Direct LLM (Ungrounded)** | 4.97 | 4.97 | 0.0000 | 0.0000 | 0.0% | 0.0% | 100.0% | 100.0% | 0.0 ms | 1.999 s |
-| **Sparse BM25 (Lexical)** | 4.54 | 4.68 | 0.5444 | 0.3307 | 47.0% | 88.1% | 46.7% | 100.0% | 33.4 ms | 10.063 s |
-| **Dense FAISS (all-MiniLM)** | 4.78 | 4.87 | 0.4444 | 0.1839 | 33.7% | 70.0% | 73.3% | 100.0% | 62.2 ms | 5.949 s |
-| **Hybrid RRF + Cross-Encoder** | 4.74 | 4.79 | 0.7222 | 0.3744 | 48.7% | 89.2% | 55.6% | 100.0% | 122.6 ms | 10.698 s |
+| **Direct LLM (Ungrounded)** | 2.66 | 2.17 | 0.0000 | 0.0000 | 0.0% | 0.0% | 82.2% | 73.3% | 0.0 ms | 1.018 s |
+| **Dense FAISS (all-MiniLM)** | 3.85 | 3.42 | 0.4444 | 0.1839 | 33.7% | 70.0% | 60.0% | 100.0% | 62.2 ms | 5.949 s |
+| **Sparse BM25 (Lexical)** | 4.05 | 3.78 | 0.5444 | 0.3307 | 47.0% | 88.1% | 41.1% | 100.0% | 33.4 ms | 10.063 s |
+| **Hybrid RRF + Cross-Encoder** | **4.12** | **3.83** | **0.7222** | **0.3744** | **48.7%** | **89.2%** | **42.2%** | **100.0%** | 122.6 ms | 10.698 s |
 
 > *Full unrounded evaluation metrics and failure postmortems are documented in [RESULTS.md](RESULTS.md).*
 

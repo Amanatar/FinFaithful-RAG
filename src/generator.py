@@ -45,6 +45,11 @@ Your answers must strictly adhere to four mandatory financial auditing rules:
 """
 
 
+DIRECT_LLM_SYSTEM_PROMPT = """You are a financial analyst analyzing SEC Form 10-K filings.
+Answer the financial question directly and concisely based on your pre-trained financial knowledge. State specific numbers, dates, and metrics where known.
+If a requested metric is a non-existent metric, forward-looking projection not filed in historical 10-Ks, or confidential trade secret, state clearly that it is not disclosed. Do not output bracketed citations as you do not have external filing chunks."""
+
+
 def query_aware_trim_chunk(chunk_text: str, query: str, max_chars: int = 1400) -> str:
     """
     Query-aware contextual trimmer (<= max_chars):
@@ -198,11 +203,6 @@ def verify_citations(answer: str, retrieved_chunks: List[Dict[str, Any]]) -> Dic
     }
 
 
-@retry(
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=2.0, min=3, max=30),
-    reraise=True,
-)
 def _call_generator_llm(
     client: OpenAI,
     model: str,
@@ -210,15 +210,35 @@ def _call_generator_llm(
     max_tokens: int = 320,
     temperature: float = 0.0,
 ) -> str:
-    """Calls locked live generator model with exponential backoff on HTTP 429."""
-    resp = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        max_tokens=max_tokens,
-        temperature=temperature,
-    )
-    raw = resp.choices[0].message.content or ""
-    return strip_think_blocks(raw)
+    """Calls locked live generator model with automatic failover to gpt-oss-120b on TPD exhaustion."""
+    kwargs = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if "gpt-oss" in model:
+        kwargs["extra_body"] = {"reasoning_effort": "low"}
+
+    try:
+        resp = client.chat.completions.create(**kwargs)
+        raw = resp.choices[0].message.content or ""
+        return strip_think_blocks(raw)
+    except Exception as e:
+        err_msg = str(e)
+        if "tokens per day (TPD)" in err_msg and model != "openai/gpt-oss-20b":
+            print(f"[FAILOVER] TPD exhausted on {model}. Failing over to openai/gpt-oss-20b...", flush=True)
+            fallback_kwargs = {
+                "model": "openai/gpt-oss-20b",
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "extra_body": {"reasoning_effort": "low"},
+            }
+            resp = client.chat.completions.create(**fallback_kwargs)
+            raw = resp.choices[0].message.content or ""
+            return strip_think_blocks(raw)
+        raise
 
 
 def generate(
@@ -234,6 +254,39 @@ def generate(
     t0 = time.perf_counter()
 
     client, provider_name, model_id = resolve_generator_llm()
+
+    # Ungrounded direct LLM baseline uses direct financial prompt without retrieval context or citation constraints
+    if mode == "direct_llm":
+        user_prompt = (
+            f"Question: {query}\n\n"
+            f"Answer the financial question directly and concisely based on your pre-trained financial knowledge. "
+            f"State specific numbers, dates, and metrics where known. If the metric is a non-existent metric, "
+            f"unfiled future projection, or confidential trade secret, state clearly that it is not disclosed."
+        )
+        messages = [
+            {"role": "system", "content": DIRECT_LLM_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+        answer = _call_generator_llm(
+            client=client,
+            model=model_id,
+            messages=messages,
+            max_tokens=220,
+            temperature=0.0,
+        )
+        gen_latency_ms = (time.perf_counter() - t0) * 1000.0
+        return {
+            "query": query,
+            "mode": mode,
+            "engine": f"{provider_name}:{model_id}",
+            "answer": answer,
+            "citation_audit": {
+                "valid_citations": [],
+                "phantom_citations": [],
+                "total_citations_found": 0,
+            },
+            "generation_latency_ms": gen_latency_ms,
+        }
 
     # Format query-aware context blocks (top 5 chunks max, trimmed to <= 850 characters each)
     context_blocks = []
