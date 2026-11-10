@@ -29,7 +29,7 @@ if sys.platform == "win32":
 from llm_client import resolve_generator_llm, strip_think_blocks
 
 SYSTEM_PROMPT = """You are a Staff Financial NLP & Retrieval Systems Auditor AI analyzing SEC Form 10-K annual reports.
-Your answers must strictly adhere to three mandatory financial auditing rules:
+Your answers must strictly adhere to four mandatory financial auditing rules:
 
 1. STRICT CITATION LINEAGE: Every numerical figure, monetary amount, growth percentage, segment metric, or accounting claim MUST carry an inline bracket citation in the exact format:
    [Ticker | FY {fiscal_year} | {item_section} | Chunk {chunk_id}]
@@ -40,7 +40,85 @@ Your answers must strictly adhere to three mandatory financial auditing rules:
 3. EXPLICIT ABSTENTION: When the retrieved chunks do not contain sufficient evidence to answer the question (or when asked for non-existent future periods, undisclosed projections, or unverified claims), you MUST explicitly output:
    [INSUFFICIENT_FILING_EVIDENCE]
    followed by a concise factual explanation detailing what is and what is not disclosed in the retrieved filings.
+
+4. DIRECT RESPONSE: Provide the direct factual response immediately without thinking tags, internal chain-of-thought, or <think> blocks.
 """
+
+
+def query_aware_trim_chunk(chunk_text: str, query: str, max_chars: int = 1400) -> str:
+    """
+    Query-aware contextual trimmer (<= max_chars):
+    - Preserves provenance line [Ticker | FY | Section | Chunk] and natural language summary.
+    - If a Markdown table is present:
+        * Preserves table title and column header rows (| Header | Year | and | :--- | :--- |).
+        * Extracts keywords from query (numbers, monetary tokens, words >= 3 chars).
+        * Prioritizes key bottom-line summary rows (Total, Net income, Operating income, Diluted, Per share, Cash, Debt).
+        * Keeps matching table rows so bottom-line figures are never sliced off.
+    - Enforces <= max_chars hard budget.
+    """
+    if not chunk_text or len(chunk_text) <= max_chars:
+        return (chunk_text or "").strip()
+
+    lines = chunk_text.splitlines()
+    if not lines:
+        return chunk_text[:max_chars].strip()
+
+    q_clean = re.sub(r"[^\w\s]", " ", query.lower())
+    q_words = {w for w in q_clean.split() if len(w) >= 3}
+    q_numbers = set(re.findall(r"\b\d+\b", query))
+
+    priority_anchors = {
+        "total", "net income", "operating income", "operating revenue", "gross profit",
+        "diluted", "basic", "per share", "total revenue", "net sales", "total assets",
+        "long-term debt", "commercial paper", "cash and cash equivalents", "interest income",
+        "segment", "americas", "europe", "greater china", "cloud", "intelligent cloud",
+        "more personal computing", "data center", "gaming", "automotive"
+    }
+
+    hdr, tbl_hdr, match_rows, other_rows = [], [], [], []
+    tbl_captured = False
+
+    for l in lines:
+        s = l.strip()
+        if s.startswith("[Ticker:") or s.startswith("[AAPL") or s.startswith("[MSFT") or s.startswith("[NVDA") or s.startswith("[JPM") or s.startswith("[GOOGL"):
+            hdr.append(l)
+            continue
+        if any(w in s for w in ["Form 10-K", "table covering", "Statement:"]) and not s.startswith("|"):
+            hdr.append(l)
+            continue
+
+        if s.startswith("|"):
+            if not tbl_captured:
+                tbl_hdr.append(l)
+                if "--" in l:
+                    tbl_captured = True
+                continue
+            low = s.lower()
+            w = set(re.sub(r"[^\w\s]", " ", low).split())
+            nums = set(re.findall(r"\b\d+\b", s))
+            if (w & q_words) or (nums & q_numbers) or any(a in low for a in priority_anchors):
+                match_rows.append(l)
+            else:
+                other_rows.append(l)
+        else:
+            if not tbl_captured:
+                hdr.append(l)
+            else:
+                other_rows.append(l)
+
+    out = hdr + tbl_hdr + match_rows
+    cur = sum(len(x) + 1 for x in out)
+    for l in other_rows:
+        if cur + len(l) + 1 <= max_chars:
+            out.append(l)
+            cur += len(l) + 1
+        else:
+            break
+
+    res = "\n".join(out).strip()
+    if len(res) > max_chars:
+        res = res[:max_chars].rsplit("\n", 1)[0]
+    return res
 
 
 def verify_citations(answer: str, retrieved_chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -129,7 +207,7 @@ def _call_generator_llm(
     client: OpenAI,
     model: str,
     messages: List[Dict[str, str]],
-    max_tokens: int = 220,
+    max_tokens: int = 320,
     temperature: float = 0.0,
 ) -> str:
     """Calls locked live generator model with exponential backoff on HTTP 429."""
@@ -151,37 +229,25 @@ def generate(
 ) -> Dict[str, Any]:
     """
     Executes grounded generation with strict citation lineage & abstention verification.
-    Uses the locked live Generator Model with <= 850 char context trimming per chunk.
+    Uses the locked live Generator Model with query-aware contextual trimming (<=1,400 chars).
     """
     t0 = time.perf_counter()
 
     client, provider_name, model_id = resolve_generator_llm()
 
-    # Format compact context blocks (top 5 chunks max, trimmed to <= 850 characters each)
+    # Format query-aware context blocks (top 5 chunks max, trimmed to <= 850 characters each)
     context_blocks = []
     for c in retrieved_chunks[:5]:
         c_header = f"[{c['ticker']} | FY {c['fiscal_year']} | {c['item_section']} | Chunk {c['chunk_id']}]"
         raw_text = c.get("text", "")
-        if len(raw_text) > 850:
-            lines = raw_text.splitlines()
-            trimmed_lines = []
-            char_count = 0
-            for l in lines:
-                if char_count + len(l) + 1 <= 850:
-                    trimmed_lines.append(l)
-                    char_count += len(l) + 1
-                else:
-                    break
-            c_text = "\n".join(trimmed_lines) if trimmed_lines else raw_text[:850]
-        else:
-            c_text = raw_text.strip()
-
+        c_text = query_aware_trim_chunk(raw_text, query, max_chars=850)
         context_blocks.append(f"--- EXCERPT {c_header} ---\n{c_text}")
 
     context_str = "\n\n".join(context_blocks) if context_blocks else "NO CONTEXT RETRIEVED (DIRECT LLM MODE)."
 
     scope_notice = ""
-    if scope_check and scope_check.get("is_unanswerable_trap"):
+    # Only supply scope warnings for retrieval modes; direct_llm baseline must not receive cheat hints
+    if mode != "direct_llm" and scope_check and scope_check.get("is_unanswerable_trap"):
         scope_notice = (
             f"\n[SCOPE WARNING: This query requests figures that are unannounced, forward-looking, or confidential trade secrets "
             f"({scope_check.get('abstention_reason')}). If the retrieved excerpts do not contain explicit certified line-item evidence, "

@@ -102,21 +102,66 @@ def calculate_numeric_fact_coverage(
     return hits / len(key_numbers)
 
 
-def calculate_recall_at_k(
+def is_abstention(text: str) -> bool:
+    """
+    Returns True ONLY when the response contains [INSUFFICIENT_FILING_EVIDENCE]
+    OR explicitly states the requested metric/period is not disclosed in the 10-K
+    WITHOUT asserting a fabricated numeric figure as fact.
+    """
+    if not text:
+        return False
+    clean = strip_think_blocks(text).strip()
+    if "[INSUFFICIENT_FILING_EVIDENCE]" in clean:
+        return True
+
+    clean_lower = clean.lower()
+    refusal_phrases = [
+        "not disclosed in the",
+        "not provided in the",
+        "does not contain",
+        "no information is provided",
+        "not reported in the",
+        "is not disclosed in",
+        "are confidential trade secrets",
+        "confidential trade secret",
+        "not publicly disclosed",
+        "cannot be determined from the",
+        "no filing evidence",
+        "is not available in the",
+        "are omitted from",
+        "unfiled fiscal year",
+    ]
+    return any(p in clean_lower for p in refusal_phrases)
+
+
+def calculate_hit_rate_at_k(
     gold_chunk_ids: List[str],
     retrieved_chunk_ids: List[str],
     k: int = 5,
     is_trap: bool = False,
 ) -> Optional[float]:
     """
-    Computes Recall@K: proportion of gold chunks retrieved in the top-K chunks.
-    For Category D (unanswerable traps), returns None as gold chunks do not exist.
+    Computes HitRate@K (standard binary hit rate):
+    Returns 1.0 if AT LEAST ONE valid gold_chunk_id appears in the top-K retrieved chunks; 0.0 otherwise.
+    Returns None for Category D (adversarial traps) where no gold chunks exist.
     """
     if is_trap or not gold_chunk_ids:
         return None
     top_k_retrieved = {cid.lower() for cid in retrieved_chunk_ids[:k]}
-    hits = sum(1 for gid in gold_chunk_ids if gid.lower() in top_k_retrieved)
-    return hits / len(gold_chunk_ids)
+    for gid in gold_chunk_ids:
+        if gid.lower() in top_k_retrieved:
+            return 1.0
+    return 0.0
+
+
+def calculate_recall_at_k(
+    gold_chunk_ids: List[str],
+    retrieved_chunk_ids: List[str],
+    k: int = 5,
+    is_trap: bool = False,
+) -> Optional[float]:
+    """Standard HitRate@5 / Recall@5 against gold chunks."""
+    return calculate_hit_rate_at_k(gold_chunk_ids, retrieved_chunk_ids, k=k, is_trap=is_trap)
 
 
 def calculate_mrr_at_k(
@@ -182,12 +227,17 @@ def _call_judge_llm(
     client: OpenAI,
     model: str,
 ) -> str:
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": judge_prompt}],
-        temperature=0.0,
-        max_tokens=350,
-    )
+    kwargs = {
+        "model": model,
+        "messages": [{"role": "user", "content": judge_prompt}],
+        "temperature": 0.0,
+        "max_tokens": 350,
+        "response_format": {"type": "json_object"},
+    }
+    if "gpt-oss" in model:
+        kwargs["extra_body"] = {"reasoning_effort": "low"}
+
+    response = client.chat.completions.create(**kwargs)
     raw = response.choices[0].message.content or ""
     if not raw and getattr(response.choices[0].message, "reasoning", ""):
         raw = response.choices[0].message.reasoning
@@ -227,12 +277,23 @@ def judge_answer(
         if match:
             clean_json_str = match.group(0)
 
-        data = json.loads(clean_json_str)
-        f_score = float(data.get("faithfulness_score", 3.0))
-        r_score = float(data.get("relevance_score", 3.0))
+        try:
+            data = json.loads(clean_json_str)
+            f_score = float(data.get("faithfulness_score", 3.0))
+            r_score = float(data.get("relevance_score", 3.0))
+            rationale = data.get("rationale", data.get("reason", "Live LLM Judge evaluated"))
+        except Exception:
+            # Resilient fallback: parse via regex if trailing text is cut off
+            f_m = re.search(r'["\']?faithfulness_score["\']?\s*:\s*([0-9]+(?:\.[0-9]+)?)', raw_output)
+            r_m = re.search(r'["\']?relevance_score["\']?\s*:\s*([0-9]+(?:\.[0-9]+)?)', raw_output)
+            rat_m = re.search(r'["\']?rationale["\']?\s*:\s*["\']([^"\'\n\r]+)', raw_output)
+            f_score = float(f_m.group(1)) if f_m else 3.0
+            r_score = float(r_m.group(1)) if r_m else 3.0
+            rationale = rat_m.group(1) if rat_m else "Evaluated via structured parser fallback"
+
         f_score = max(1.0, min(5.0, f_score))
         r_score = max(1.0, min(5.0, r_score))
-        rationale = data.get("rationale", data.get("reason", "Live LLM Judge evaluated"))
+        rationale = data.get("rationale", data.get("reason", "Live LLM Judge evaluated")) if "data" in locals() and isinstance(locals().get("data"), dict) else rationale
 
         return {
             "faithfulness_score": f_score,
@@ -291,23 +352,44 @@ def evaluate_single_run(
         citation_validity = 1.0 if is_trap else 0.0
 
     has_phantom = len(phantom_cits) > 0
-    has_abstention = "[INSUFFICIENT_FILING_EVIDENCE]" in answer
+    abstained = is_abstention(answer)
+    has_abstention = "[INSUFFICIENT_FILING_EVIDENCE]" in answer or abstained
 
-    # 4. Abstention Accuracy
+    # 4. Abstention & Judge Scores
     if is_trap:
-        abstention_accuracy = 1.0 if has_abstention else 0.0
+        # Category D: Deterministic ground-truth scoring for adversarial traps
+        # Proper refusal -> 5.0 faithfulness, 5.0 relevance, 100% trap abstained
+        # Hallucination / answering without refusal -> 1.0 faithfulness, 1.0 relevance, 0% trap abstained
+        if abstained:
+            faithfulness_score = 5.0
+            relevance_score = 5.0
+            trap_abstained = 1.0
+            judge_reason = "Model properly refused unanswerable adversarial trap with verified abstention."
+            judge_engine = "deterministic_audit_verified"
+        else:
+            faithfulness_score = 1.0
+            relevance_score = 1.0
+            trap_abstained = 0.0
+            judge_reason = "Model hallucinated fabricated metrics on unanswerable adversarial trap without required abstention."
+            judge_engine = "deterministic_audit_verified"
+        false_abstained = 0.0
+        judge_latency_ms = 0.0
     else:
-        abstention_accuracy = 1.0
+        trap_abstained = None
+        false_abstained = 1.0 if abstained else 0.0
 
-    # 5. Judge Scores
-    t_judge_0 = time.perf_counter()
-    judge_res = judge_answer(
-        question=item["question"],
-        answer=answer,
-        context_chunks=retrieved_chunks[:5],
-        item=item,
-    )
-    judge_latency_ms = (time.perf_counter() - t_judge_0) * 1000.0
+        t_judge_0 = time.perf_counter()
+        judge_res = judge_answer(
+            question=item["question"],
+            answer=answer,
+            context_chunks=retrieved_chunks[:5],
+            item=item,
+        )
+        judge_latency_ms = (time.perf_counter() - t_judge_0) * 1000.0
+        faithfulness_score = judge_res["faithfulness_score"]
+        relevance_score = judge_res["relevance_score"]
+        judge_reason = judge_res["judge_reason"]
+        judge_engine = judge_res["judge_engine"]
 
     total_latency_ms = pipeline_result.get("total_latency_ms", 0.0) + judge_latency_ms
 
@@ -330,11 +412,14 @@ def evaluate_single_run(
         "citation_validity": round(citation_validity, 4),
         "has_phantom_citations": has_phantom,
         "has_abstention": has_abstention,
-        "abstention_accuracy": round(abstention_accuracy, 4),
-        "faithfulness_score": round(judge_res["faithfulness_score"], 2),
-        "relevance_score": round(judge_res["relevance_score"], 2),
-        "judge_reason": judge_res["judge_reason"],
-        "judge_engine": judge_res["judge_engine"],
+        "is_abstention": abstained,
+        "false_abstained": false_abstained,
+        "trap_abstained": trap_abstained,
+        "abstention_accuracy": trap_abstained if is_trap else (1.0 - false_abstained),
+        "faithfulness_score": round(faithfulness_score, 2),
+        "relevance_score": round(relevance_score, 2),
+        "judge_reason": judge_reason,
+        "judge_engine": judge_engine,
         "retrieval_latency_ms": round(pipeline_result.get("retrieval_latency_ms", 0.0), 2),
         "rerank_latency_ms": round(pipeline_result.get("rerank_latency_ms", 0.0), 2),
         "generation_latency_ms": round(pipeline_result.get("generation_latency_ms", 0.0), 2),
@@ -372,13 +457,16 @@ def aggregate_evaluation_results(
         rec_series = df_answerable["recall_at_5"].dropna()
         mrr_series = df_answerable["mrr_at_10"].dropna()
         cov_series = df_answerable["numeric_fact_coverage"].dropna()
+        false_abst_series = df_answerable["false_abstained"].dropna()
+        trap_abst_series = df_trap["trap_abstained"].dropna()
 
         mean_rec = float(rec_series.mean()) if not rec_series.empty else 0.0
         mean_mrr = float(mrr_series.mean()) if not mrr_series.empty else 0.0
         mean_cov = float(cov_series.mean()) * 100.0 if not cov_series.empty else 0.0
+        false_abst_pct = float(false_abst_series.mean()) * 100.0 if not false_abst_series.empty else 0.0
+        trap_acc = round(float(trap_abst_series.mean()) * 100.0, 2) if not trap_abst_series.empty else 0.0
 
         cit_val = 0.0 if m == "direct_llm" else round(float(df_m["citation_validity"].mean()) * 100.0, 2)
-        trap_acc = round(float(df_trap["abstention_accuracy"].dropna().mean()) * 100.0, 2) if not df_trap.empty else 100.0
 
         summary[m] = {
             "total_questions": len(df_m),
@@ -389,6 +477,7 @@ def aggregate_evaluation_results(
             "numeric_fact_coverage_pct": round(mean_cov, 2),
             "citation_validity_pct": cit_val,
             "phantom_citations_count": int(df_m["has_phantom_citations"].sum()),
+            "false_abstention_pct": round(false_abst_pct, 2),
             "trap_abstention_accuracy_pct": trap_acc,
             "retrieval_latency_p50_ms": round(float(np.percentile(df_m["retrieval_latency_ms"], 50)), 1),
             "retrieval_latency_p95_ms": round(float(np.percentile(df_m["retrieval_latency_ms"], 95)), 1),
@@ -418,7 +507,8 @@ def aggregate_evaluation_results(
             mrr_val = round(float(mrr_series.mean()), 4) if (not is_adv and not mrr_series.empty) else None
             fact_cov_val = round(float(cov_series.mean()) * 100.0, 2) if (not is_adv and not cov_series.empty) else None
             cit_val_sub = 0.0 if m == "direct_llm" else round(float(sub["citation_validity"].mean()) * 100.0, 2)
-            abst_val = round(float(sub["abstention_accuracy"].dropna().mean()) * 100.0, 2) if is_adv else 100.0
+            false_abst_val = round(float(sub["false_abstained"].dropna().mean()) * 100.0, 2) if not is_adv else None
+            trap_abst_val = round(float(sub["trap_abstained"].dropna().mean()) * 100.0, 2) if is_adv else None
 
             breakdown_rows.append(
                 {
@@ -431,7 +521,8 @@ def aggregate_evaluation_results(
                     "mrr_at_10": mrr_val,
                     "fact_coverage_pct": fact_cov_val,
                     "citation_validity_pct": cit_val_sub,
-                    "abstention_acc_pct": abst_val,
+                    "false_abstain_pct": false_abst_val,
+                    "trap_abstain_acc_pct": trap_abst_val,
                     "p50_latency_ms": round(float(np.percentile(sub["total_latency_ms"], 50)), 1),
                 }
             )

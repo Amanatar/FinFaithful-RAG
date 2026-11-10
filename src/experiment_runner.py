@@ -19,6 +19,7 @@ Features:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 
@@ -31,6 +32,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 from dotenv import load_dotenv
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 if sys.platform == "win32":
     try:
@@ -162,10 +164,10 @@ def generate_results_markdown(
     lines.append("## 1. Main 4-Method Comparison Table")
     lines.append("")
     lines.append(
-        "| Pipeline Mode | Faithfulness (1-5) | Relevance (1-5) | Recall@5 | MRR@10 | Numeric Fact Coverage % | Citation Validity % | Trap Abstention Acc % | Retrieval P50 (ms) | Total Latency P50 (s) |"
+        "| Pipeline Mode | Faithfulness (1-5) | Relevance (1-5) | HitRate@5 | MRR@10 | Numeric Fact Coverage % | Citation Validity % | False Abstention % | Trap Abstention Acc % | Retrieval P50 (ms) | Total Latency P50 (s) |"
     )
     lines.append(
-        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |"
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |"
     )
 
     mode_labels = {
@@ -184,8 +186,8 @@ def generate_results_markdown(
             f"| {lbl} | {s['mean_faithfulness']:.2f} | {s['mean_relevance']:.2f} | "
             f"{s['mean_recall_at_5']:.4f} | {s['mean_mrr_at_10']:.4f} | "
             f"{s['numeric_fact_coverage_pct']:.1f}% | {s['citation_validity_pct']:.1f}% | "
-            f"{s['trap_abstention_accuracy_pct']:.1f}% | {s['retrieval_latency_p50_ms']:.1f} ms | "
-            f"{s['end_to_end_latency_p50_s']:.3f} s |"
+            f"{s.get('false_abstention_pct', 0.0):.1f}% | {s['trap_abstention_accuracy_pct']:.1f}% | "
+            f"{s['retrieval_latency_p50_ms']:.1f} ms | {s['end_to_end_latency_p50_s']:.3f} s |"
         )
 
     lines.append("")
@@ -194,10 +196,10 @@ def generate_results_markdown(
     lines.append("## 2. Per-Category Breakdown")
     lines.append("")
     lines.append(
-        "| Category | Mode | Count | Faithfulness (1-5) | Relevance (1-5) | Recall@5 | Fact Coverage % | Citation Validity % | Abstention Acc % | P50 Latency (ms) |"
+        "| Category | Mode | Count | Faithfulness (1-5) | Relevance (1-5) | HitRate@5 | Fact Coverage % | Citation Validity % | False Abstain % | Trap Abstain Acc % | P50 Latency (ms) |"
     )
     lines.append(
-        "| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |"
+        "| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |"
     )
 
     cat_labels = {
@@ -211,10 +213,12 @@ def generate_results_markdown(
         c_lbl = cat_labels.get(row["category"], row["category"])
         rec_str = f"{row['recall_at_5']:.4f}" if pd.notna(row["recall_at_5"]) else "N/A"
         fact_str = f"{row['fact_coverage_pct']:.1f}%" if pd.notna(row["fact_coverage_pct"]) else "N/A"
+        false_abst_str = f"{row['false_abstain_pct']:.1f}%" if pd.notna(row.get("false_abstain_pct")) else "N/A"
+        trap_abst_str = f"{row['trap_abstain_acc_pct']:.1f}%" if pd.notna(row.get("trap_abstain_acc_pct")) else "N/A"
         lines.append(
             f"| {c_lbl} | `{row['mode']}` | {row['count']} | {row['faithfulness']:.2f} | {row['relevance']:.2f} | "
             f"{rec_str} | {fact_str} | {row['citation_validity_pct']:.1f}% | "
-            f"{row['abstention_acc_pct']:.1f}% | {row['p50_latency_ms']:.1f} ms |"
+            f"{false_abst_str} | {trap_abst_str} | {row['p50_latency_ms']:.1f} ms |"
         )
 
     lines.append("")
@@ -363,7 +367,8 @@ def main():
         completed_count = len(completed_keys)
 
         with open(jsonl_output, "a", encoding="utf-8") as f_out:
-            for item, mode in pending_tasks:
+            while pending_tasks:
+                item, mode = pending_tasks[0]
                 t0 = time.time()
                 try:
                     record = run_single_evaluation(item, mode)
@@ -372,23 +377,45 @@ def main():
                     all_runs.append(record)
                     completed_keys.add((mode, item["question_id"]))
                     completed_count += 1
+                    pending_tasks.pop(0)
                     elapsed = round(time.time() - t0, 2)
                     rec_display = f"{record['recall_at_5']:.2f}" if record["recall_at_5"] is not None else "N/A"
                     cov_display = f"{record['numeric_fact_coverage']*100:.0f}%" if record["numeric_fact_coverage"] is not None else "N/A"
                     print(
                         f"[{completed_count:03d}/{total_expected}] Mode: {mode:<14} | "
-                        f"ID: {item['question_id']:<14} | Rec@5: {rec_display} | "
+                        f"ID: {item['question_id']:<14} | Hit@5: {rec_display} | "
                         f"FactCov: {cov_display} | Faith: {record['faithfulness_score']:.1f} | Latency: {elapsed}s",
                         flush=True,
                     )
-                    # Safe TPM rate pacing (600ms between calls to stay well within limits)
-                    time.sleep(0.6)
+                    # TPM-safe pacing (~1.6s between questions to stay smoothly below 8,000 TPM)
+                    time.sleep(1.6)
                 except Exception as e:
-                    print(f"ERROR on [{mode} | {item['question_id']}]: {e}", flush=True)
-                    time.sleep(2.0)
+                    err_str = str(e)
+                    wait_sec = 25.0
+                    m_wait = re.search(r"try again in (?:(\d+)\s*m\s*)?(\d+(?:\.\d+)?)\s*s", err_str, re.IGNORECASE)
+                    if m_wait:
+                        mins = float(m_wait.group(1)) if m_wait.group(1) else 0.0
+                        secs = float(m_wait.group(2)) if m_wait.group(2) else 0.0
+                        wait_sec = mins * 60.0 + secs + 3.0
+                    print(f"RATE_LIMIT/ERROR on [{mode} | {item['question_id']}]: {e}. Backing off for {wait_sec:.1f}s...", flush=True)
+                    time.sleep(wait_sec)
 
         total_duration = round(time.time() - start_time, 1)
         print(f"\nAll benchmark executions finished in {total_duration}s.")
+
+    # Hard Completion Gate Verification before Aggregation
+    total_completed = len(all_runs)
+    assert total_completed == total_expected, (
+        f"CRITICAL GATE FAILED: Only {total_completed} / {total_expected} completed! "
+        f"Aborting aggregation until all 480 evaluations are finished."
+    )
+    for cat in ["table_numeric", "yoy_footnote_reasoning", "cross_company_comparative", "adversarial_unanswerable"]:
+        for m in modes:
+            cnt = len([r for r in all_runs if r["category"] == cat and r["mode"] == m])
+            assert cnt == 30, (
+                f"CRITICAL GATE FAILED: Category {cat} Mode {m} has count {cnt} != 30!"
+            )
+    print(f"\n[HARD GATE PASSED] Verified exact 480/480 run completion (Count=30 in all 16 Category x Mode cells).")
 
     # Aggregate metrics
     from evaluate import aggregate_evaluation_results
@@ -419,19 +446,19 @@ def main():
     print("EMPIRICAL EVALUATION SUMMARY TABLE (EXACT METRICS)")
     print("=" * 70)
     print(
-        f"{'Pipeline Mode':<28} | {'Faith':<5} | {'Rel':<5} | {'Rec@5':<6} | {'MRR@10':<6} | "
-        f"{'FactCov':<7} | {'CitVal':<6} | {'Abstain':<7} | {'P50 (ms)':<8}"
+        f"{'Pipeline Mode':<20} | {'Faith':<5} | {'Rel':<5} | {'Hit@5':<6} | {'MRR@10':<6} | "
+        f"{'FactCov':<7} | {'CitVal':<6} | {'FalseAb':<7} | {'TrapAb':<6} | {'P50 (ms)':<8}"
     )
-    print("-" * 92)
+    print("-" * 96)
 
     for m in ALL_MODES:
         if m in summary:
             s = summary[m]
             print(
-                f"{m:<28} | {s['mean_faithfulness']:<5.2f} | {s['mean_relevance']:<5.2f} | "
+                f"{m:<20} | {s['mean_faithfulness']:<5.2f} | {s['mean_relevance']:<5.2f} | "
                 f"{s['mean_recall_at_5']:<6.4f} | {s['mean_mrr_at_10']:<6.4f} | "
                 f"{s['numeric_fact_coverage_pct']:<6.1f}% | {s['citation_validity_pct']:<5.1f}% | "
-                f"{s['trap_abstention_accuracy_pct']:<6.1f}% | {s['retrieval_latency_p50_ms']:<8.1f}"
+                f"{s.get('false_abstention_pct', 0.0):<6.1f}% | {s['trap_abstention_accuracy_pct']:<5.1f}% | {s['retrieval_latency_p50_ms']:<8.1f}"
             )
     print("=" * 70)
 

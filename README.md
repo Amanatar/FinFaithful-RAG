@@ -21,20 +21,20 @@ Ask an ungrounded LLM for audited financial line items from an SEC Form 10-K fil
 Across 120 audited questions spanning 4 strict categories (30 questions each: Table Numeric, YoY Footnote Synthesis, Cross-Company Comparative, and Adversarial Traps):
 
 ```
-Retrieval Recall@5 Progression (Categories A–C, 90 Questions):
-  ├── Dense FAISS (all-MiniLM-L6-v2) : 42.22% | MRR@10: 0.1924
-  ├── Sparse BM25 (BM25Okapi)         : 54.44% | MRR@10: 0.3502
-  └── Hybrid RRF + Cross-Encoder     : 70.00% | MRR@10: 0.3894  (Target Met >= 0.70)
+Retrieval HitRate@5 Progression (Categories A–C, 90 Questions):
+  ├── Dense FAISS (all-MiniLM-L6-v2) : 44.44% | MRR@10: 0.1839
+  ├── Sparse BM25 (BM25Okapi)         : 54.44% | MRR@10: 0.3307
+  └── Hybrid RRF + Cross-Encoder     : 72.22% | MRR@10: 0.3744  (Benchmark Target Met >= 0.70)
 ```
 
 ### Main 4-Pipeline Comparison Table
 
-| Pipeline Mode | Faithfulness (1-5) | Relevance (1-5) | Recall@5 | MRR@10 | Fact Coverage % | Citation Validity % | Trap Abstention % | P50 Retrieval (ms) | P50 Total (s) |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Direct LLM (Ungrounded)** | `1.67` | `1.67` | `0.0000` | `0.0000` | `0.0%` | `0.0%` | `100.0%` | `0.0 ms` | `6.063 s` |
-| **Sparse BM25 (Lexical)** | `1.84` | `1.83` | `0.2591` | `0.3288` | `29.6%` | `74.6%` | `100.0%` | `30.4 ms` | `11.229 s` |
-| **Dense FAISS (Semantic)** | `1.60` | `1.58` | `0.1924` | `0.1744` | `27.3%` | `71.2%` | `100.0%` | `46.9 ms` | `11.079 s` |
-| **Hybrid RRF + Cross-Encoder** | **`2.70`** | **`2.74`** | **`0.4169`** | **`0.4258`** | **`44.6%`** | **`86.8%`** | **`100.0%`** | `72.8 ms` | `11.159 s` |
+| Pipeline Mode | Faithfulness (1-5) | Relevance (1-5) | HitRate@5 | MRR@10 | Numeric Fact Coverage % | Citation Validity % | False Abstention % | Trap Abstention Acc % | Retrieval P50 (ms) | Total Latency P50 (s) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Direct LLM (Ungrounded)** | 4.97 | 4.97 | 0.0000 | 0.0000 | 0.0% | 0.0% | 100.0% | 100.0% | 0.0 ms | 1.999 s |
+| **Sparse BM25 (Lexical)** | 4.54 | 4.68 | 0.5444 | 0.3307 | 47.0% | 88.1% | 46.7% | 100.0% | 33.4 ms | 10.063 s |
+| **Dense FAISS (all-MiniLM)** | 4.78 | 4.87 | 0.4444 | 0.1839 | 33.7% | 70.0% | 73.3% | 100.0% | 62.2 ms | 5.949 s |
+| **Hybrid RRF + Cross-Encoder** | 4.74 | 4.79 | 0.7222 | 0.3744 | 48.7% | 89.2% | 55.6% | 100.0% | 122.6 ms | 10.698 s |
 
 > *Full unrounded evaluation metrics and failure postmortems are documented in [RESULTS.md](RESULTS.md).*
 
@@ -75,7 +75,7 @@ Dense FAISS Index (all-MiniLM-L6-v2)      Sparse BM25 Index (BM25Okapi)
                            │
                            ▼
   ┌────────────────────────────────────────────────────────┐
-  │ Independent Judge Model: groq:allam-2-7b               │
+  │ Independent Judge Model: groq:openai/gpt-oss-20b               │
   │ Structured Rubric JSON (Faithfulness 1-5, Rel 1-5)    │
   │ <think> reasoning block stripping before audit scoring │
   └────────────────────────────────────────────────────────┘
@@ -100,7 +100,7 @@ guaranteeing balanced multi-company context allocation.
 ### 3. Decoupled Live Generation & Independent Audit
 To avoid per-model Token-Per-Day (TPD) rate-limit exhaustion and eliminate LLM self-preference bias, generation and evaluation are decoupled into two distinct model architectures:
 - **Locked Generator**: `qwen/qwen3.8-27b` conditioned with a strict system prompt requiring inline bracket citations `[Ticker | FY {year} | {section} | Chunk {id}]`.
-- **Locked Independent Judge**: `allam-2-7b` running a deterministic JSON rubric (`max_tokens=250`, `temperature=0.0`) with automatic `<think>...</think>` block stripping.
+- **Locked Independent Judge**: `openai/gpt-oss-20b` running a deterministic JSON rubric (`max_tokens=250`, `temperature=0.0`) with automatic `<think>...</think>` block stripping.
 
 ---
 

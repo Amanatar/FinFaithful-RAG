@@ -84,9 +84,9 @@ def resolve_generator_llm() -> Tuple[OpenAI, str, str]:
         groq_gen_candidates = [
             os.getenv("GROQ_GENERATOR_MODEL", ""),
             "meta-llama/llama-4-scout-17b-16e-instruct",
-            "qwen/qwen3-32b",
+            "llama-3.1-8b-instant",
             "qwen/qwen3.8-27b",
-            "llama-3.3-70b-versatile",
+            "openai/gpt-oss-120b",
         ]
         for m in [c for c in groq_gen_candidates if c]:
             try:
@@ -135,18 +135,22 @@ def resolve_judge_llm() -> Tuple[OpenAI, str, str]:
         groq_judge_candidates = [
             os.getenv("GROQ_JUDGE_MODEL", ""),
             "llama-3.1-8b-instant",
-            "allam-2-7b",
             "openai/gpt-oss-20b",
             "openai/gpt-oss-120b",
+            "allam-2-7b",
         ]
         for m in [c for c in groq_judge_candidates if c]:
             try:
-                resp = client.chat.completions.create(
-                    model=m,
-                    messages=[{"role": "user", "content": '{"faithfulness_score": 5, "relevance_score": 5, "rationale": "OK"}'}],
-                    max_tokens=30,
-                    temperature=0.0,
-                )
+                kwargs = {
+                    "model": m,
+                    "messages": [{"role": "user", "content": '{"faithfulness_score": 5, "relevance_score": 5, "rationale": "OK"}'}],
+                    "max_tokens": 50,
+                    "temperature": 0.0,
+                }
+                if "gpt-oss" in m:
+                    kwargs["extra_body"] = {"reasoning_effort": "low"}
+
+                resp = client.chat.completions.create(**kwargs)
                 content = resp.choices[0].message.content or ""
                 if content or getattr(resp.choices[0].message, "reasoning", ""):
                     _CACHED_JUDGE_CLIENT = client
